@@ -13,6 +13,7 @@ Modern React + Vite web interface for the Geo-Nexus Satellite Change Detection s
   - 💧 **Water Dynamics** (River expansion, reservoirs, flood inundation)
 - **Interactive Before / After Wipe Slider**: Smooth wipe divider to inspect changes against natural optical imagery.
 - **Saved Predictions Gallery**: Permanent local and server SQLite persistence with instant 0-second reloads.
+- **Explicit analysis provenance**: Geo-Nexus AI is the primary action; Spectral Index Analysis (S-CVA) is a separately selected diagnostic method. Each saved result and history card records its source.
 
 ## Getting Started
 
@@ -41,6 +42,8 @@ Ensure `VITE_API_URL` points to your running Flask backend:
 ```env
 VITE_API_URL=http://localhost:5000
 ```
+
+AI inference requires a working Google Earth Engine connection for real Sentinel-1 inputs. If the backend falls back to Sentinel-2-only STAC imagery, AI analysis reports that the model input is incomplete. The explicitly selected spectral method can use that STAC imagery and is always labeled as spectral analysis.
 
 ### 4. Development Server
 

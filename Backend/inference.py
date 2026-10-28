@@ -36,6 +36,7 @@ _model = None
 _norm_stats = None
 _manifest = None
 _device = None
+EXPECTED_CHANNEL_ORDER = ["B2", "B3", "B4", "B5", "B6", "B7", "B8", "B8A", "B9", "B11", "B12", "NDVI", "NDBI", "VV", "VH", "VH_VV", "Q"]
 
 
 def _load_model():
@@ -63,6 +64,11 @@ def _load_model():
     with open(manifest_path) as f:
         _manifest = json.load(f)
 
+    if _manifest.get("input_channels") != 17 or _manifest.get("channel_order") != EXPECTED_CHANNEL_ORDER or _manifest.get("patch_size") != PATCH:
+        raise ValueError("Model manifest does not match the runtime's 17-channel, 128-pixel input contract.")
+    if len(_norm_stats.get("mean", [])) != 17 or len(_norm_stats.get("std", [])) != 17:
+        raise ValueError("Model normalization file must provide 17 train-only channel means and standard deviations.")
+
     # Determine device
     device_pref = os.environ.get("DEVICE", "cpu").lower()
     if device_pref == "cuda" and torch.cuda.is_available():
@@ -79,8 +85,10 @@ def _load_model():
         state = state["model_state_dict"]
     elif isinstance(state, dict) and "state_dict" in state:
         state = state["state_dict"]
+    elif isinstance(state, dict) and isinstance(state.get("model"), dict):
+        state = state["model"]
 
-    model.load_state_dict(state, strict=False)
+    model.load_state_dict(state, strict=True)
     model.set_mode("gated")
     model.eval()
     model.to(_device)
@@ -94,20 +102,22 @@ def _load_model():
 # Normalisation
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _normalize(tensor_int16: np.ndarray) -> np.ndarray:
+def _normalize(tensor: np.ndarray) -> np.ndarray:
     """
-    Convert int16 [17, H, W] GEE tensor to normalized float32 for the model.
+    Convert the acquisition's float32 [17, H, W] tensor to normalized model input.
 
     Channels 0-10:  optical raw, stored as ρ×10000 → divide by 10000 then z-score
-    Channels 11-12: NDVI, NDBI — already in [-1,1] in float, stored as float/1 — pass through
+    Channels 11-12: NDVI, NDBI — already in [-1,1] — pass through
     Channels 13-15: SAR VV/VH/VH_VV, stored as dB×100 → divide by 100, then z-score
-    Channel 16:     Q (n_clear) — pass through [0,1]
+    Channel 16:     Q (clip(n_clear / 8, 0, 1)) — pass through
     """
-    arr = tensor_int16.astype(np.float32)
+    arr = tensor.astype(np.float32)
     scale = float(_norm_stats.get("array_scale", 10000.0))
     sar_scale = float(_norm_stats.get("sar_extra_scale", 100.0))
     mu = np.array(_norm_stats["mean"], dtype=np.float32)   # [17]
     sigma = np.array(_norm_stats["std"], dtype=np.float32)  # [17]
+    if mu.shape != (17,) or sigma.shape != (17,) or not np.isfinite(mu).all() or not np.isfinite(sigma).all() or np.any(sigma <= 0):
+        raise ValueError("Model normalization statistics must contain 17 finite means and positive standard deviations.")
 
     # Rescale from stored integer
     arr[:11] = arr[:11] / scale          # optical: DN → reflectance
@@ -391,9 +401,20 @@ def run_inference(
     """
     _load_model()
 
+    for name, tensor in (("t1_tensor", t1_tensor), ("t2_tensor", t2_tensor)):
+        if not isinstance(tensor, np.ndarray) or tensor.ndim != 3 or tensor.shape[0] != 17:
+            raise ValueError(f"{name} must have shape [17, H, W] to match the trained model contract.")
+        if not np.isfinite(tensor).all():
+            raise ValueError(f"{name} contains non-finite values.")
+    if t1_tensor.shape != t2_tensor.shape or min(t1_tensor.shape[1:]) < PATCH:
+        raise ValueError("T1 and T2 inputs must have identical spatial dimensions of at least 128×128.")
+
+    threshold_override = threshold is not None
+    env_threshold = os.environ.get("MODEL_THRESHOLD")
     if threshold is None:
-        threshold = float(os.environ.get("MODEL_THRESHOLD",
-                                          _manifest.get("threshold", 0.28)))
+        threshold = float(env_threshold if env_threshold is not None else _manifest.get("threshold", 0.28))
+    if not np.isfinite(threshold) or not 0 < float(threshold) < 1:
+        raise ValueError("AI probability threshold must be between 0 and 1.")
 
     # Normalize
     t1_norm = _normalize(t1_tensor)  # [17, H, W] float32
@@ -450,6 +471,9 @@ def run_inference(
     }
 
     return {
+        "model_version": _manifest.get("version", "unknown"),
+        "threshold": float(threshold),
+        "threshold_source": "request override" if threshold_override else "MODEL_THRESHOLD environment setting" if env_threshold is not None else _manifest.get("threshold_source", "model manifest"),
         "change_prob_b64": change_prob_b64,
         "change_mask_b64": multicolor_mask_b64,
         "binary_mask_b64": binary_mask_b64,

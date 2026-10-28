@@ -45,6 +45,11 @@ def _init_db():
         """)
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_dates ON predictions(date_t1, date_t2)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_created_at ON predictions(created_at DESC)")
+        columns = {row[1] for row in cursor.execute("PRAGMA table_info(predictions)").fetchall()}
+        for name in ("engine", "algorithm", "provider", "status"):
+            if name not in columns:
+                cursor.execute(f"ALTER TABLE predictions ADD COLUMN {name} TEXT NOT NULL DEFAULT 'unknown'")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_engine_dates ON predictions(engine, date_t1, date_t2)")
         conn.commit()
         conn.close()
 
@@ -72,6 +77,10 @@ def save_prediction(record: dict) -> dict:
     result = record.get("result") or {}
     stats = result.get("stats") or record.get("stats") or {}
     dynamics = result.get("dynamics") or record.get("dynamics") or {}
+    engine = result.get("engine") or record.get("engine") or "unknown"
+    algorithm = result.get("algorithm") or record.get("algorithm") or "unknown"
+    provider = (result.get("meta") or {}).get("provider") or record.get("provider") or "unknown"
+    status = record.get("status") or result.get("status") or ("success" if result.get("success") else "unknown")
 
     bbox_json = json.dumps(bbox)
     stats_json = json.dumps(stats)
@@ -85,12 +94,12 @@ def save_prediction(record: dict) -> dict:
             INSERT OR REPLACE INTO predictions (
                 id, location_name, timestamp, created_at,
                 bbox_json, date_t1, date_t2,
-                stats_json, dynamics_json, result_json
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                stats_json, dynamics_json, result_json, engine, algorithm, provider, status
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
             pred_id, loc_name, timestamp, created_at,
             bbox_json, date_t1, date_t2,
-            stats_json, dynamics_json, result_json
+            stats_json, dynamics_json, result_json, engine, algorithm, provider, status
         ))
         conn.commit()
         conn.close()
@@ -106,6 +115,10 @@ def save_prediction(record: dict) -> dict:
         "stats": stats,
         "dynamics": dynamics,
         "result": result,
+        "engine": engine,
+        "algorithm": algorithm,
+        "provider": provider,
+        "status": status,
     }
 
 
@@ -119,7 +132,7 @@ def get_all_predictions(include_full_result: bool = True) -> list[dict]:
         cursor.execute("""
             SELECT id, location_name, timestamp, created_at,
                    bbox_json, date_t1, date_t2,
-                   stats_json, dynamics_json, result_json
+                   stats_json, dynamics_json, result_json, engine, algorithm, provider, status
             FROM predictions
             ORDER BY created_at DESC
         """)
@@ -153,6 +166,10 @@ def get_all_predictions(include_full_result: bool = True) -> list[dict]:
             "dateT2": r["date_t2"],
             "stats": stats,
             "dynamics": dynamics,
+            "engine": r["engine"] or "unknown",
+            "algorithm": r["algorithm"] or "unknown",
+            "provider": r["provider"] or "unknown",
+            "status": r["status"] or "unknown",
         }
 
         if include_full_result:
@@ -177,7 +194,7 @@ def get_prediction_by_id(pred_id: str) -> dict | None:
         cursor.execute("""
             SELECT id, location_name, timestamp, created_at,
                    bbox_json, date_t1, date_t2,
-                   stats_json, dynamics_json, result_json
+                   stats_json, dynamics_json, result_json, engine, algorithm, provider, status
             FROM predictions
             WHERE id = ?
         """, (pred_id,))
@@ -215,6 +232,10 @@ def get_prediction_by_id(pred_id: str) -> dict | None:
         "stats": stats,
         "dynamics": dynamics,
         "result": result,
+        "engine": row["engine"] or "unknown",
+        "algorithm": row["algorithm"] or "unknown",
+        "provider": row["provider"] or "unknown",
+        "status": row["status"] or "unknown",
     }
 
 
@@ -249,7 +270,7 @@ def is_bbox_match(b1: dict, b2: dict, tol: float = 0.008) -> bool:
         return False
 
 
-def find_matching_prediction(bbox: dict, date_t1: str, date_t2: str, tol: float = 0.008) -> dict | None:
+def find_matching_prediction(bbox: dict, date_t1: str, date_t2: str, tol: float = 0.008, engine: str = "geonexus_ai") -> dict | None:
     """
     Searches the permanent database for a matching prior prediction with identical
     dates and matching bbox bounds within tolerance.
@@ -263,7 +284,7 @@ def find_matching_prediction(bbox: dict, date_t1: str, date_t2: str, tol: float 
         cursor.execute("""
             SELECT id, location_name, timestamp, created_at,
                    bbox_json, date_t1, date_t2,
-                   stats_json, dynamics_json, result_json
+                   stats_json, dynamics_json, result_json, engine, algorithm, provider, status
             FROM predictions
             WHERE date_t1 = ? AND date_t2 = ?
             ORDER BY created_at DESC
@@ -274,7 +295,7 @@ def find_matching_prediction(bbox: dict, date_t1: str, date_t2: str, tol: float 
     for r in rows:
         try:
             b = json.loads(r["bbox_json"]) if r["bbox_json"] else {}
-            if is_bbox_match(b, bbox, tol=tol):
+            if (r["engine"] or "unknown") == engine and is_bbox_match(b, bbox, tol=tol):
                 try:
                     res = json.loads(r["result_json"]) if r["result_json"] else {}
                 except Exception:
@@ -290,6 +311,10 @@ def find_matching_prediction(bbox: dict, date_t1: str, date_t2: str, tol: float 
                     "stats": json.loads(r["stats_json"]) if r["stats_json"] else {},
                     "dynamics": json.loads(r["dynamics_json"]) if r["dynamics_json"] else {},
                     "result": res,
+                    "engine": r["engine"] or "unknown",
+                    "algorithm": r["algorithm"] or "unknown",
+                    "provider": r["provider"] or "unknown",
+                    "status": r["status"] or "unknown",
                 }
         except Exception:
             continue

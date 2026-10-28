@@ -3,6 +3,7 @@
  * Ensures predictions persist permanently across server restarts, reboots, and browser sessions.
  */
 import axios from 'axios';
+import { findPredictionForEngine } from './analysisMethods';
 
 const STORAGE_KEY = 'geonexus_saved_predictions_v3';
 const API = import.meta.env.VITE_API_URL || 'http://localhost:5000';
@@ -30,7 +31,7 @@ function setLocalCache(items) {
   try {
     const trimmed = items.slice(0, MAX_LOCAL_CACHE);
     localStorage.setItem(STORAGE_KEY, JSON.stringify(trimmed));
-  } catch (e) {
+  } catch {
     try {
       const reduced = items.slice(0, 3);
       localStorage.setItem(STORAGE_KEY, JSON.stringify(reduced));
@@ -70,6 +71,10 @@ export async function savePrediction(prediction) {
     ...prediction,
     id,
     timestamp,
+    engine: prediction.engine || prediction.result.engine || 'unknown',
+    algorithm: prediction.algorithm || prediction.result.algorithm || 'unknown',
+    provider: prediction.provider || prediction.result.meta?.provider || 'unknown',
+    status: prediction.status || (prediction.result.success ? 'success' : 'unknown'),
   };
 
   // 1. Update local cache immediately
@@ -77,7 +82,8 @@ export async function savePrediction(prediction) {
     const local = getSavedPredictions();
     const filtered = local.filter((item) => {
       if (item.id === id) return false;
-      if (isBBoxAndDateMatch(item.bbox, item.dateT1, item.dateT2, record.bbox, record.dateT1, record.dateT2)) {
+      if ((item.engine || item.result?.engine || 'unknown') === record.engine &&
+          isBBoxAndDateMatch(item.bbox, item.dateT1, item.dateT2, record.bbox, record.dateT1, record.dateT2)) {
         return false;
       }
       return true;
@@ -140,12 +146,8 @@ export function isBBoxAndDateMatch(b1, t1_a, t2_a, b2, t1_b, t2_b, tol = 0.008) 
 /**
  * Finds if an active bounding box and date pair matches an existing saved prediction.
  */
-export function findMatchingPrediction(bbox, dateT1, dateT2, predictionsList = null) {
+export function findMatchingPrediction(bbox, dateT1, dateT2, predictionsList = null, engine = 'geonexus_ai') {
   if (!bbox || !dateT1 || !dateT2) return null;
   const list = predictionsList || getSavedPredictions();
-  return (
-    list.find((item) =>
-      isBBoxAndDateMatch(item.bbox, item.dateT1, item.dateT2, bbox, dateT1, dateT2)
-    ) || null
-  );
+  return findPredictionForEngine(list, bbox, dateT1, dateT2, engine);
 }

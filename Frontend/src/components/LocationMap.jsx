@@ -1,4 +1,4 @@
-import React, { useState, useCallback } from 'react';
+import React, { useState } from 'react';
 import { MapContainer, TileLayer, Rectangle, useMapEvents, useMap } from 'react-leaflet';
 import 'leaflet/dist/leaflet.css';
 import L from 'leaflet';
@@ -238,7 +238,7 @@ function MapFlyTo({ bbox }) {
       ];
       try {
         map.fitBounds(bounds, { padding: [50, 50], maxZoom: 15, duration: 0.8 });
-      } catch (err) {
+      } catch {
         // silent catch if unmounted
       }
     }

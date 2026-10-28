@@ -260,19 +260,8 @@ def _read_band_rasterio(href, bbox, size):
 
 
 def _read_band_requests(href, bbox, size):
-    """
-    Fallback: download the whole GeoTIFF and let PIL crop/resize with Lanczos.
-    """
-    if isinstance(size, (tuple, list)):
-        out_h, out_w = int(size[0]), int(size[1])
-    else:
-        out_h, out_w = int(size), int(size)
-
-    resp = requests.get(href, timeout=30, stream=True)
-    resp.raise_for_status()
-    img = Image.open(io.BytesIO(resp.content))
-    img = img.resize((out_w, out_h), Image.LANCZOS)
-    return np.array(img, dtype=np.float32)
+    """Reject non-geospatial reads; resizing a whole tile ignores the requested bbox."""
+    raise RuntimeError("Rasterio is required for bbox-aware STAC COG reads.")
 
 
 def _get_band(item, asset_key, bbox, size, fallback_items=None):
@@ -493,6 +482,7 @@ def fetch_imagery(
     t2_tensor, t2_rgb = build_tensor_and_rgb(item_t2, fallbacks_t2, "T2 (After)")
 
     meta = {
+        "provider": "Sentinel-2 STAC",
         "source": "Sentinel-2 L2A (European Space Agency / Open Data)",
         "t1_scene_id": item_t1.id,
         "t1_cloud_pct": item_t1.properties.get("eo:cloud_cover", "N/A"),
@@ -501,7 +491,12 @@ def fetch_imagery(
         "t2_cloud_pct": item_t2.properties.get("eo:cloud_cover", "N/A"),
         "t2_datetime": str(item_t2.datetime or item_t2.properties.get("datetime", "")),
         "s1_used": False,
-        "s1_note": "S1 channels filled with training-distribution mean",
+        "sar_channels_available": False,
+        "s1_note": "STAC result is Sentinel-2 only; SAR and Q tensor slots are placeholders and are invalid for AI inference.",
+        "crs": "EPSG:4326",
+        "output_shape": [int(target_shape[0]), int(target_shape[1])],
+        "pixel_resolution_m": None,
+        "resolution_note": "Resampled to bbox dimensions; ground pixel size varies with bbox.",
         "thumb_size": thumb_size,
     }
 

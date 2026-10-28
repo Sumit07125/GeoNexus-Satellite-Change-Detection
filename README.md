@@ -17,8 +17,8 @@
 ## Key Highlights
 
 - **Dual-Engine Analytical Framework**:
-  - **Deep Learning Engine (MH-DAPT-CD v3.2)**: Siamese ResNet with multi-spectral `SplitStem`, cross-temporal difference fusion, and attention decoders trained via Domain-Adaptive Pre-Training (DAPT) and few-shot adaptation ($k=30$).
-  - **Spectral Dynamics Engine (Physical Fusion)**: Google Earth Engine integration combining Google Dynamic World (10m LULC) with Spectral Change Vector Analysis ($\Delta\text{NDVI}$, $\Delta\text{NDBI}$, $\Delta\text{MNDWI}$, $\Delta\text{BSI}$) and morphological filtering.
+  - **Primary AI model (MH-DAPT-CD v3.2)**: Siamese ResNet with multi-spectral `SplitStem`, cross-temporal difference fusion, and attention decoders trained via DAPT and few-shot adaptation ($k=30$). Live inference requires Sentinel-2 plus real Sentinel-1 features from Google Earth Engine.
+  - **Explicit spectral diagnostic (S-CVA)**: Independent optical-index change-vector analysis ($\Delta\text{NDVI}$, $\Delta\text{NDBI}$, $\Delta\text{NDWI}$, $\Delta\text{BSI}$) with spatial filtering. It does not use the neural model.
 - **Categorical Surface Dynamics & Interactive Filtering**:
   - 🏗️ **Urban & Structural Changes** (`#eab308` Yellow): Built-up expansion, infrastructure developments, high-albedo transitions.
   - 🌾 **Soil & Agricultural Dynamics** (`#f97316` Orange): Fallow fields, harvest cycles, bare soil exposure.
@@ -29,8 +29,8 @@
   - Interactive bounding box drawer with real-time ground distance, aspect ratio, and area calculation ($m^2$ / hectares).
   - Client-side layer filtering allowing instant toggling of individual surface dynamic categories without re-fetching.
   - Split-screen comparison, opacity sliders, and geocoded location search.
-- **Pre-Seeded Offline Evaluator Mode**:
-  - Includes a pre-populated SQLite database with cached inference runs across Maharashtra test regions (Dhule, Navi Mumbai, Pune, Satara) allowing immediate demonstration without GEE authentication.
+- **Persistent Prediction History**:
+  - Completed results are stored in SQLite. Sentinel-2 STAC supports the spectral method without GEE; AI analysis reports a clear input error if real Sentinel-1 features are unavailable.
 
 ---
 
@@ -52,7 +52,7 @@ flowchart TD
 
     subgraph Engines["Analytical Processing Engines"]
         GEE["Google Earth Engine API\n(Sentinel-2 L2A Harmonized + Dynamic World)"]
-        STAC["Microsoft Planetary Computer STAC\n(Fallback Ingestion)"]
+        STAC["Element84 Sentinel-2 STAC\n(Spectral imagery fallback)"]
         DL["MH-DAPT-CD v3.2 Siamese CNN\n(PyTorch Inference Engine)"]
         SCVA["Spectral Change Vector Analysis (S-CVA)\n(Physical Index Engine)"]
     end
@@ -129,7 +129,7 @@ Major Project/
 - **Python**: Version 3.10 or 3.11
 - **Node.js**: Version 18 or higher (with `npm`)
 - **Git & Git LFS**: Ensure Git Large File Storage is installed (`git lfs --version`)
-- *(Optional)* **Google Earth Engine Account**: For live satellite data acquisition (cached mode works without it).
+- **Google Earth Engine Account**: Required for live AI inference because its model contract includes real Sentinel-1 features. Sentinel-2 STAC is available to the separately selected spectral method.
 
 ---
 
@@ -255,11 +255,12 @@ The deep learning model **MH-DAPT-CD v3.2** was trained through a 4-phase protoc
 | Endpoint | Method | Description |
 |---|---|---|
 | `/api/health` | `GET` | Health check and engine readiness diagnostic. |
-| `/api/detect` | `POST` | Core detection endpoint. Accepts bbox coordinates, dates, and cloud filters. |
-| `/api/history` | `GET` | Retrieves all saved predictions from local SQLite storage. |
-| `/api/predict/save` | `POST` | Saves current analysis results and metadata to database. |
-| `/api/predict/delete/<id>` | `DELETE` | Removes a saved record from local storage. |
-| `/api/presets` | `GET` | Returns built-in geographical demonstration zones. |
+| `/api/detect/start` | `POST` | Starts Geo-Nexus AI analysis (requires real SAR model inputs). |
+| `/api/detect/spectral/start` | `POST` | Starts explicit Spectral Index Analysis (S-CVA), without the neural model. |
+| `/api/detect/status/<job_id>` | `GET` | Retrieves job progress, result, or structured error. |
+| `/api/predictions` | `GET` / `POST` | Lists or saves engine-labeled SQLite history. |
+| `/api/predictions/<id>` | `GET` / `DELETE` | Reads or removes one saved prediction. |
+| `/api/predictions/match` | `POST` | Matches a saved result by engine, bbox, and dates. |
 
 ---
 

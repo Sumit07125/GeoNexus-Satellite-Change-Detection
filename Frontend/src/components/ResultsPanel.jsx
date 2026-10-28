@@ -1,5 +1,6 @@
-import React, { useState, useEffect, useMemo } from 'react';
+import React, { useState, useEffect } from 'react';
 import { createFilteredOverlay } from '../utils/overlayFilter';
+import { getEngineLabel } from '../utils/analysisMethods';
 
 /* ─────────────────────────────────────────────────────────────
    Surface dynamics color palette & metadata
@@ -157,7 +158,7 @@ function ComparisonSlider({ t1Src, t2Src, overlaySrc, t1Date, t2Date }) {
 }
 
 /* ── Surface Dynamics Classification Section with interactive toggles ── */
-function DynamicsSection({ dynamics, totalHa, changePct, activeFilters, onToggleFilter }) {
+function DynamicsSection({ dynamics, activeFilters, onToggleFilter }) {
   if (!dynamics || Object.keys(dynamics).length === 0) return null;
 
   // Render order: Urban & Structural first, then Vegetation, Soil, Water
@@ -226,7 +227,7 @@ function DynamicsSection({ dynamics, totalHa, changePct, activeFilters, onToggle
                       }}
                       onClick={(e) => {
                         e.stopPropagation();
-                        onToggleFilter && onToggleFilter(key);
+                        onToggleFilter?.(key);
                       }}
                       title={isChecked ? "Layer visible (click to hide)" : "Layer hidden (click to show)"}
                     >
@@ -303,7 +304,6 @@ function Modal({ src, title, date, onClose }) {
 /* ── Main ResultsPanel Component ───────────────────────────── */
 export default function ResultsPanel({
   data,
-  onOverlayChange,
   activeFilters: parentFilters,
   onToggleFilter: parentToggleFilter,
   onSetAllFilters: parentSetAllFilters,
@@ -356,9 +356,8 @@ export default function ResultsPanel({
       activeFilters
     ).then((resUrl) => {
       setFilteredOverlay(resUrl);
-      if (onOverlayChange) onOverlayChange(resUrl);
     });
-  }, [data?.t2_rgb, data?.change_mask, data?.overlay, activeFilters]);
+  }, [data, activeFilters]);
 
   if (!data) {
     return (
@@ -376,7 +375,6 @@ export default function ResultsPanel({
   const {
     t1_rgb,
     t2_rgb,
-    change_mask,
     binary_mask,
     change_prob,
     overlay,
@@ -384,7 +382,39 @@ export default function ResultsPanel({
     stats,
     meta,
     location_name,
+    engine,
+    algorithm,
+    model_version,
+    threshold,
+    threshold_source,
   } = data;
+  const sourceLabel = getEngineLabel(data);
+  const isAi = engine === 'geonexus_ai';
+  const exportSummary = () => {
+    const summary = {
+      prediction_id: data.saved_id || null,
+      status: data.success ? 'success' : 'unknown',
+      engine: engine || 'unknown',
+      source: sourceLabel,
+      algorithm: algorithm || 'unknown',
+      model_version: model_version || null,
+      location: location_name || 'Selected Area',
+      dates: { t1: meta?.t1_date || null, t2: meta?.t2_date || null },
+      provider: meta?.provider || 'unknown',
+      acquisition: meta || {},
+      threshold: threshold ?? stats?.threshold ?? null,
+      threshold_source: threshold_source || 'unknown',
+      statistics: stats || {},
+      dynamics: dynamics || {},
+      note: 'Changed-area percentage is a model or spectral output estimate, not evaluation accuracy. Probability/score is not a calibrated confidence metric.',
+    };
+    const url = URL.createObjectURL(new Blob([JSON.stringify(summary, null, 2)], { type: 'application/json' }));
+    const anchor = document.createElement('a');
+    anchor.href = url;
+    anchor.download = `geo-nexus_${engine || 'unknown'}_${(meta?.t1_date || 't1')}_${(meta?.t2_date || 't2')}.json`;
+    anchor.click();
+    URL.revokeObjectURL(url);
+  };
 
   const changePct = stats?.change_pct ?? 0;
   const badgeClass = changePct > 20 ? 'change-high' : changePct > 8 ? 'change-med' : 'change-low';
@@ -418,7 +448,12 @@ export default function ResultsPanel({
           <span className={`results-badge ${badgeClass}`}>
             {changePct}% · {changeLabel}
           </span>
+          <span className={`engine-source-badge ${isAi ? 'ai' : engine === 'spectral_scva' ? 'spectral' : 'unknown'}`}>
+            {sourceLabel}
+          </span>
         </div>
+
+        <button className="btn btn-ghost" type="button" onClick={exportSummary}>↓ Export result summary</button>
 
         {/* View Switcher Tabs */}
         <div className="view-mode-tabs">
@@ -474,8 +509,8 @@ export default function ResultsPanel({
 
           {/* Panel 3: T2 Overlap Mask (Satellite Fusion) with Dynamic Layer Filter */}
           <PanelCard
-            title="T2 Overlap Mask (Satellite Fusion)"
-            subtitle="Satellite + Dynamics Overlay"
+            title="T2 Change Overlay"
+            subtitle={sourceLabel}
             icon="🔥"
             accent="#ef4444"
             badge={layerBadgeText}
@@ -567,6 +602,26 @@ export default function ResultsPanel({
               </div>
             }
           />
+          <PanelCard
+            title="Binary Change Mask"
+            subtitle="White = flagged change · Black = unchanged"
+            icon="◩"
+            accent="#a78bfa"
+            src={binary_mask}
+            onClick={openModal}
+            extraControl={
+              <div className="mask-legend"><span><i className="mask-swatch changed" /> Flagged change</span><span><i className="mask-swatch stable" /> Unchanged</span></div>
+            }
+          />
+          <PanelCard
+            title={isAi ? 'Change Probability Map' : 'Spectral Change Magnitude'}
+            subtitle={isAi ? 'Sigmoid model output · not calibrated confidence' : 'Normalized heuristic score · not AI confidence'}
+            icon="◉"
+            accent="#38bdf8"
+            src={change_prob}
+            onClick={openModal}
+            extraControl={<div className="heatmap-legend"><span>Lower score</span><i /><span>Higher score</span></div>}
+          />
         </div>
       )}
 
@@ -584,8 +639,6 @@ export default function ResultsPanel({
       {/* ── Surface Dynamics Classification with interactive card toggles ── */}
       <DynamicsSection
         dynamics={dynamics}
-        totalHa={stats?.changed_area_ha}
-        changePct={changePct}
         activeFilters={activeFilters}
         onToggleFilter={toggleFilter}
       />
@@ -663,23 +716,23 @@ export default function ResultsPanel({
 
         <div className="stat-card">
           <div className="stat-value" style={{ color: 'var(--c-teal)' }}>
-            {stats?.changed_area_ha?.toLocaleString() ?? '—'} ha
+            {stats?.changed_area_ha != null ? `${stats.changed_area_ha.toLocaleString()} ha` : '—'}
           </div>
-          <div className="stat-label">Affected Hectares</div>
+          <div className="stat-label">Estimated changed area</div>
         </div>
 
         <div className="stat-card">
           <div className="stat-value" style={{ color: 'var(--c-accent2)' }}>
-            {stats?.max_prob ? `${(stats.max_prob * 100).toFixed(0)}%` : '—'}
+            {Number.isFinite(stats?.max_prob) ? `${(stats.max_prob * 100).toFixed(0)}%` : '—'}
           </div>
-          <div className="stat-label">Peak Confidence</div>
+          <div className="stat-label">{isAi ? 'Peak predicted probability' : 'Peak spectral score'}</div>
         </div>
 
         <div className="stat-card">
           <div className="stat-value" style={{ color: 'var(--c-purple)' }}>
-            {stats?.threshold ?? 0.28}
+            {threshold ?? stats?.threshold ?? '—'}
           </div>
-          <div className="stat-label">Model Threshold</div>
+          <div className="stat-label">Applied {isAi ? 'probability' : 'CVA magnitude'} threshold</div>
         </div>
 
         <div className="stat-card">
@@ -695,9 +748,15 @@ export default function ResultsPanel({
         <div className="cd-meta-row">
           <span>📅 T1 Window: {meta.t1_window || meta.t1_date}</span>
           <span>📅 T2 Date: {meta.t2_date}</span>
+          <span>🛰 Provider: {meta.provider || 'Unknown'}</span>
+          {model_version && <span>🧠 Model: {model_version}</span>}
           <span>🎯 BBox: [{meta.bbox?.map((n) => Number(n).toFixed(3)).join(', ')}]</span>
+          {stats?.pixel_area_m2_estimate != null && <span>▦ Approx. pixel area: {stats.pixel_area_m2_estimate.toLocaleString()} m²</span>}
+          {threshold_source && <span>Threshold source: {threshold_source}</span>}
+          {meta.resolution_note && <span>{meta.resolution_note}</span>}
         </div>
       )}
+      <p className="results-metric-note">Changed-area percentage and hectares are estimates for this output raster; they are not evaluation accuracy. {isAi ? 'The displayed probability is the model sigmoid output and is not calibrated confidence.' : 'Spectral scores are heuristic change magnitudes, not AI confidence.'}</p>
 
       {/* ── Modal ── */}
       {modal && (

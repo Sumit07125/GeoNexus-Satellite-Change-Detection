@@ -182,3 +182,27 @@
     border-right-color: var(--border);
   }
 }
+/* Analysis method and metric provenance */
+.advanced-analysis { margin-top: .75rem; border: 1px solid var(--c-border); border-radius: var(--radius); background: rgba(12, 22, 38, .82); padding: .8rem .9rem; }
+.analysis-input-note { margin: .6rem 0 .35rem; color: var(--c-text3); font-size: .68rem; line-height: 1.45; }
+.advanced-analysis summary { cursor: pointer; color: var(--c-teal); font-size: .82rem; font-weight: 650; }
+.advanced-analysis summary:focus-visible { outline: 2px solid var(--c-teal); outline-offset: 3px; border-radius: 3px; }
+.advanced-analysis p { color: var(--c-text2); font-size: .76rem; line-height: 1.55; margin: .65rem 0; }
+.engine-source-badge { display: inline-flex; align-items: center; border-radius: 999px; padding: .34rem .66rem; font-size: .72rem; font-weight: 700; letter-spacing: .01em; border: 1px solid currentColor; }
+.engine-source-badge.ai { color: #7dd3fc; background: rgba(14, 116, 144, .14); }
+.engine-source-badge.spectral { color: #86efac; background: rgba(22, 101, 52, .16); }
+.engine-source-badge.unknown { color: #cbd5e1; background: rgba(100, 116, 139, .16); }
+.results-metric-note { margin: .8rem 0; padding: .65rem .8rem; border-left: 2px solid var(--c-teal); color: var(--c-text2); background: rgba(12, 22, 38, .58); font-size: .76rem; }
+.mask-legend, .heatmap-legend { display: flex; align-items: center; justify-content: space-between; gap: .6rem; color: var(--c-text2); font-size: .7rem; }
+.mask-legend span { display: inline-flex; align-items: center; gap: .35rem; }
+.mask-swatch { width: .65rem; height: .65rem; display: inline-block; border: 1px solid #64748b; }
+.mask-swatch.changed { background: white; }
+.mask-swatch.stable { background: #05070b; }
+.heatmap-legend i { display: block; flex: 1; max-width: 8rem; height: .45rem; border-radius: 999px; background: linear-gradient(90deg, #08306b, #ffff66, #a50f15); }
+.cd-meta-row { flex-wrap: wrap; }
+@media (max-width: 640px) {
+  .results-header { align-items: flex-start; flex-direction: column; }
+  .results-title-group { flex-wrap: wrap; }
+  .engine-source-badge { max-width: 100%; white-space: normal; }
+  .advanced-analysis { padding: .7rem; }
+}

@@ -10,7 +10,7 @@ import {
   deletePrediction,
   findMatchingPrediction,
 } from './utils/storage';
-import { createFilteredOverlay } from './utils/overlayFilter';
+import { ANALYSIS_METHODS, DEFAULT_ANALYSIS_ENGINE } from './utils/analysisMethods';
 
 const API = import.meta.env.VITE_API_URL || 'http://localhost:5000';
 
@@ -40,7 +40,7 @@ export default function App() {
   const [activeView, setActiveView] = useState('map');
 
   // ── Search & Location State ───────────────────────────────────
-  const [bbox, setBbox] = useState(null);
+  const [bbox, setBboxState] = useState(null);
   const [locationName, setLocationName] = useState('');
   const [dateT1, setDateT1] = useState('2021-03-15');
   const [dateT2, setDateT2] = useState('2024-03-15');
@@ -126,27 +126,29 @@ export default function App() {
     };
   }, [isResizing]);
 
-  // Sync coordinate input fields when bbox is set/drawn on the map
-  useEffect(() => {
-    if (bbox) {
-      const cLat = ((bbox.lat_min + bbox.lat_max) / 2).toFixed(4);
-      const cLon = ((bbox.lon_min + bbox.lon_max) / 2).toFixed(4);
+  const setBbox = useCallback((nextBbox) => {
+    const resolved = typeof nextBbox === 'function' ? nextBbox(bbox) : nextBbox;
+    setBboxState(resolved);
+    if (resolved) {
+      const cLat = ((resolved.lat_min + resolved.lat_max) / 2).toFixed(4);
+      const cLon = ((resolved.lon_min + resolved.lon_max) / 2).toFixed(4);
       setCoordLat(cLat);
       setCoordLon(cLon);
-      setBoundLatMin(bbox.lat_min.toFixed(4));
-      setBoundLatMax(bbox.lat_max.toFixed(4));
-      setBoundLonMin(bbox.lon_min.toFixed(4));
-      setBoundLonMax(bbox.lon_max.toFixed(4));
+      setBoundLatMin(resolved.lat_min.toFixed(4));
+      setBoundLatMax(resolved.lat_max.toFixed(4));
+      setBoundLonMin(resolved.lon_min.toFixed(4));
+      setBoundLonMax(resolved.lon_max.toFixed(4));
     }
   }, [bbox]);
 
   // Check if a saved prediction already exists for the active bbox + dates
-  const cachedMatch = findMatchingPrediction(bbox, dateT1, dateT2, savedPredictions);
+  const cachedMatch = findMatchingPrediction(bbox, dateT1, dateT2, savedPredictions, DEFAULT_ANALYSIS_ENGINE);
+  const cachedSpectralMatch = findMatchingPrediction(bbox, dateT1, dateT2, savedPredictions, 'spectral_scva');
 
   // ── Permanent SQLite server sync & health check on mount ──────
   useEffect(() => {
     axios.get(`${API}/api/health`, { timeout: 5000 })
-      .then(() => setApiStatus('ok'))
+      .then(({ data }) => setApiStatus(data.model_checkpoint_available ? 'ok' : 'degraded'))
       .catch(() => setApiStatus('error'));
 
     // Pull permanent database predictions from server disk
@@ -192,8 +194,10 @@ export default function App() {
     const lonMin = parseFloat(boundLonMin);
     const lonMax = parseFloat(boundLonMax);
 
-    if (isNaN(latMin) || isNaN(latMax) || isNaN(lonMin) || isNaN(lonMax) || latMin >= latMax || lonMin >= lonMax) {
-      setError('Please enter valid bounding box bounds with Min < Max.');
+    if (isNaN(latMin) || isNaN(latMax) || isNaN(lonMin) || isNaN(lonMax) ||
+        latMin < -90 || latMax > 90 || lonMin < -180 || lonMax > 180 ||
+        latMin >= latMax || lonMin >= lonMax) {
+      setError('Enter an ordered bounding box within latitude −90…90° and longitude −180…180°.');
       return;
     }
     setError(null);
@@ -207,7 +211,7 @@ export default function App() {
   };
 
   // ── Load cached prediction immediately ────────────────────────
-  const handleLoadCachedPrediction = (cachedItem) => {
+  const handleLoadCachedPrediction = useCallback((cachedItem) => {
     const match = cachedItem || cachedMatch;
     if (!match) return;
 
@@ -219,7 +223,7 @@ export default function App() {
     setSelectedPredictionId(match.id);
     setActiveView('predictions');
     setShowMapToast(false);
-  };
+  }, [cachedMatch, setBbox]);
 
   // ── Analyze handler — with automatic cache retrieval ─────────
   const handleAnalyze = useCallback(async () => {
@@ -240,6 +244,7 @@ export default function App() {
     setLoading(true);
 
     let pollInterval = null;
+    let pollTimeout = null;
 
     try {
       const payload = {
@@ -253,7 +258,7 @@ export default function App() {
 
       // Step 1: Submit job — returns immediately with job_id
       const { data: startData } = await axios.post(
-        `${API}/api/detect/start`, payload, { timeout: 15_000 }
+        `${API}${ANALYSIS_METHODS[DEFAULT_ANALYSIS_ENGINE].endpoint}`, payload, { timeout: 15_000 }
       );
       if (!startData.success) throw new Error(startData.error || 'Failed to start job');
 
@@ -271,13 +276,16 @@ export default function App() {
 
             if (statusData.status === 'done') {
               clearInterval(pollInterval);
+              clearTimeout(pollTimeout);
               resolve(statusData.result);
             } else if (statusData.status === 'error') {
               clearInterval(pollInterval);
+              clearTimeout(pollTimeout);
               reject(new Error(statusData.error || 'Job failed on server'));
             }
           } catch (pollErr) {
             clearInterval(pollInterval);
+            clearTimeout(pollTimeout);
             if (pollErr.response?.status === 404 || pollErr.response?.data?.error?.includes('not found')) {
               reject(new Error('Server was restarted — please click Analyze again.'));
             } else {
@@ -286,7 +294,7 @@ export default function App() {
           }
         }, 3000);
 
-        setTimeout(() => {
+        pollTimeout = setTimeout(() => {
           clearInterval(pollInterval);
           reject(new Error('Analysis timed out after 8 minutes. Try a smaller area.'));
         }, 480_000);
@@ -311,18 +319,24 @@ export default function App() {
 
     } catch (err) {
       if (pollInterval) clearInterval(pollInterval);
+      if (pollTimeout) clearTimeout(pollTimeout);
       const msg = err.response?.data?.error || err.message || 'Unexpected error';
       setError(msg);
     } finally {
       setLoading(false);
     }
-  }, [bbox, locationName, dateT1, dateT2, windowDays, maxCloud, cachedMatch]);
+  }, [bbox, locationName, dateT1, dateT2, windowDays, maxCloud, cachedMatch, handleLoadCachedPrediction]);
 
   // ── Enhanced Spectral Analysis handler (no ML model — pure spectral indices) ──
   const handleSpectralAnalyze = useCallback(async () => {
     if (!bbox) { setError('Please select or enter coordinates for an area on the map.'); return; }
     if (!dateT1 || !dateT2) { setError('Please select both T1 and T2 dates.'); return; }
     if (dateT1 >= dateT2) { setError('T1 (Before) date must be earlier than T2 (After) date.'); return; }
+
+    if (cachedSpectralMatch) {
+      handleLoadCachedPrediction(cachedSpectralMatch);
+      return;
+    }
 
     setError(null);
     setResult(null);
@@ -331,6 +345,7 @@ export default function App() {
     setLoading(true);
 
     let pollInterval = null;
+    let pollTimeout = null;
 
     try {
       const payload = {
@@ -343,7 +358,7 @@ export default function App() {
       };
 
       const { data: startData } = await axios.post(
-        `${API}/api/detect/spectral/start`, payload, { timeout: 15_000 }
+        `${API}${ANALYSIS_METHODS.spectral_scva.endpoint}`, payload, { timeout: 15_000 }
       );
       if (!startData.success) throw new Error(startData.error || 'Failed to start spectral job');
 
@@ -358,17 +373,20 @@ export default function App() {
             if (statusData.progress) setLiveProgress(statusData.progress);
             if (statusData.status === 'done') {
               clearInterval(pollInterval);
+              clearTimeout(pollTimeout);
               resolve(statusData.result);
             } else if (statusData.status === 'error') {
               clearInterval(pollInterval);
+              clearTimeout(pollTimeout);
               reject(new Error(statusData.error || 'Spectral job failed on server'));
             }
           } catch (pollErr) {
             clearInterval(pollInterval);
+            clearTimeout(pollTimeout);
             reject(pollErr);
           }
         }, 3000);
-        setTimeout(() => {
+        pollTimeout = setTimeout(() => {
           clearInterval(pollInterval);
           reject(new Error('Analysis timed out after 8 minutes. Try a smaller area.'));
         }, 480_000);
@@ -388,12 +406,13 @@ export default function App() {
       });
     } catch (err) {
       if (pollInterval) clearInterval(pollInterval);
+      if (pollTimeout) clearTimeout(pollTimeout);
       const msg = err.response?.data?.error || err.message || 'Unexpected error';
       setError(msg);
     } finally {
       setLoading(false);
     }
-  }, [bbox, locationName, dateT1, dateT2, windowDays, maxCloud]);
+  }, [bbox, locationName, dateT1, dateT2, windowDays, maxCloud, cachedSpectralMatch, handleLoadCachedPrediction]);
 
   // ── Determine which prediction to display in Predictions Studio ──
   const effectivePredictionId = selectedPredictionId || (result ? 'active' : (savedPredictions[0]?.id || null));
@@ -420,7 +439,6 @@ export default function App() {
     bare_soil: true,
     water: true,
   });
-  const [activeOverlayUrl, setActiveOverlayUrl] = useState(null);
 
   const handleToggleOverlayFilter = useCallback((key) => {
     setOverlayFilters((prev) => ({ ...prev, [key]: !prev[key] }));
@@ -434,27 +452,6 @@ export default function App() {
       water: enable,
     });
   }, []);
-
-  // Synchronize client-side blended overlay for active displayed prediction
-  useEffect(() => {
-    if (!activeDisplayedResult) {
-      setActiveOverlayUrl(null);
-      return;
-    }
-    createFilteredOverlay(
-      activeDisplayedResult.t2_rgb,
-      activeDisplayedResult.change_mask,
-      activeDisplayedResult.overlay,
-      overlayFilters
-    ).then((url) => {
-      setActiveOverlayUrl(url);
-    });
-  }, [
-    activeDisplayedResult?.t2_rgb,
-    activeDisplayedResult?.change_mask,
-    activeDisplayedResult?.overlay,
-    overlayFilters,
-  ]);
 
   const canAnalyze = bbox && dateT1 && dateT2 && !loading;
 
@@ -516,7 +513,7 @@ export default function App() {
           <div className="status-dot" style={{
             background: apiStatus === 'ok' ? 'var(--c-green)' : apiStatus === 'error' ? 'var(--c-red)' : 'var(--c-amber)',
           }} />
-          {apiStatus === 'ok' ? 'API Online' : apiStatus === 'error' ? 'API Offline' : 'Connecting…'}
+          {apiStatus === 'ok' ? 'API Online · Weights Available' : apiStatus === 'degraded' ? 'API Online · Model Missing' : apiStatus === 'error' ? 'API Offline' : 'Connecting…'}
         </div>
       </nav>
 
@@ -744,7 +741,7 @@ export default function App() {
                       <span>Saved Prediction Available!</span>
                     </div>
                     <div className="cached-alert-desc">
-                      This exact location has already been predicted ({cachedMatch.result?.stats?.change_pct}% change). You can load it instantly with 0s wait.
+                      This location has a saved {cachedMatch.result?.engine_label || 'AI'} result ({cachedMatch.result?.stats?.change_pct}% changed area). It can be loaded instantly.
                     </div>
                     <div className="cached-alert-actions">
                       <button
@@ -861,6 +858,14 @@ export default function App() {
                     🔄 Try Again
                   </button>
                   <button
+                    className="btn btn-spectral"
+                    style={{ fontSize: '0.8rem', padding: '0.4rem 0.8rem' }}
+                    onClick={handleSpectralAnalyze}
+                    disabled={!bbox || !dateT1 || !dateT2 || loading}
+                  >
+                    Run Spectral Analysis
+                  </button>
+                  <button
                     className="btn btn-ghost"
                     style={{ fontSize: '0.8rem', padding: '0.4rem 0.8rem' }}
                     onClick={() => setError(null)}
@@ -870,6 +875,8 @@ export default function App() {
                 </div>
               </div>
             )}
+
+            <p className="analysis-input-note">AI input grid: 10 m pixels, at least 128×128 (about 1.3 km per side), up to roughly 40 km² per request.</p>
 
             {/* ── Main Analyze Button ────────────────────── */}
             <button
@@ -884,34 +891,22 @@ export default function App() {
                 </>
               ) : cachedMatch ? (
                 <>
-                  ⚡ Load Saved Prediction (Instant)
+                  ⚡ Load Saved AI Result
                 </>
               ) : (
                 <>
-                  🔍 Analyze Change Detection
+                  🔍 Run Geo-Nexus AI Analysis
                 </>
               )}
             </button>
 
-            {/* ── Enhanced (Spectral) Analysis Button ── */}
-            <button
-              className="btn btn-spectral btn-full fade-in-up fade-delay-3"
-              disabled={!canAnalyze}
-              onClick={handleSpectralAnalyze}
-              title="Compute change using multi-spectral index differencing (NDVI · NDWI · NDBI · BSI ensemble)"
-            >
-              {loading ? (
-                <>
-                  <span className="spinner" />
-                  Computing…
-                </>
-              ) : (
-                <>
-                  <span style={{ fontSize: '0.9em' }}>⚲</span>
-                  Enhanced Analysis
-                </>
-              )}
-            </button>
+            <details className="advanced-analysis fade-in-up fade-delay-3">
+              <summary>Advanced Analysis · Spectral diagnostic</summary>
+              <p>AI inference may struggle with unfamiliar regional conditions. Run Spectral Index Analysis as an alternative diagnostic method. It uses optical indices and does not run the trained neural model.</p>
+              <button className="btn btn-spectral btn-full" disabled={!canAnalyze} onClick={handleSpectralAnalyze}>
+                {loading ? <><span className="spinner" /> Computing…</> : cachedSpectralMatch ? '⚡ Load Saved Spectral Result' : '⚲ Run Spectral Index Analysis (S-CVA)'}
+              </button>
+            </details>
 
             {/* ── Quick Presets ─────────────────────────── */}
             <div className="panel fade-in-up fade-delay-4" style={{ opacity: 0.85 }}>
@@ -1005,7 +1000,7 @@ export default function App() {
                   )}
                   {savedPredictions.map((saved) => (
                     <option key={saved.id} value={saved.id}>
-                      📍 {saved.locationName} ({saved.dateT1} → {saved.dateT2}) — {saved.result?.stats?.change_pct}% Change
+                      📍 {saved.locationName} ({saved.dateT1} → {saved.dateT2}) — {saved.result?.engine_label || 'Source unknown'} — {saved.result?.stats?.change_pct}%
                     </option>
                   ))}
                   {!result && savedPredictions.length === 0 && (
@@ -1048,6 +1043,16 @@ export default function App() {
 
             {/* Prediction Studio Content */}
             <div className="prediction-content-wrapper">
+              {error && (
+                <div className="error-box" role="alert" style={{ marginBottom: '1rem', justifyContent: 'space-between', flexWrap: 'wrap' }}>
+                  <span><span className="error-icon">⚠</span> {error}</span>
+                  <span style={{ display: 'flex', gap: '.5rem', flexWrap: 'wrap' }}>
+                    <button className="btn btn-primary" onClick={handleAnalyze} disabled={loading || !bbox}>Retry AI</button>
+                    <button className="btn btn-spectral" onClick={handleSpectralAnalyze} disabled={loading || !bbox}>Run Spectral Analysis</button>
+                    <button className="btn btn-ghost" onClick={() => setError(null)}>Dismiss</button>
+                  </span>
+                </div>
+              )}
               {loading ? (
                 <div className="live-running-card">
                   <div className="radar-scan-box">
@@ -1071,7 +1076,6 @@ export default function App() {
                   activeFilters={overlayFilters}
                   onToggleFilter={handleToggleOverlayFilter}
                   onSetAllFilters={handleSetAllOverlayFilters}
-                  onOverlayChange={setActiveOverlayUrl}
                 />
               ) : (
                 <div className="prediction-empty-card">
@@ -1148,6 +1152,10 @@ export default function App() {
                           {changePct}% Change
                         </span>
                       </div>
+                      <div className={`engine-source-badge ${saved.engine === 'geonexus_ai' || saved.result?.engine === 'geonexus_ai' ? 'ai' : saved.engine === 'spectral_scva' || saved.result?.engine === 'spectral_scva' ? 'spectral' : 'unknown'}`}>
+                        {saved.result?.engine_label || (saved.engine === 'geonexus_ai' ? 'Geo-Nexus AI Model' : saved.engine === 'spectral_scva' ? 'Spectral Index Analysis (S-CVA)' : 'Source unknown')}
+                      </div>
+                      <div className="saved-item-date">{saved.provider || saved.result?.meta?.provider || 'Provider unknown'} · {saved.algorithm || saved.result?.algorithm || 'Algorithm unknown'}</div>
 
                       <div className="saved-item-metrics">
                         <div className="saved-metric-block">

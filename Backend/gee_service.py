@@ -152,7 +152,7 @@ def _get_s2_composite(bbox: ee.Geometry, date_str: str, window_days: int, max_cl
     return composite.addBands([ndvi, ndbi, n_clear]), col.size().getInfo()
 
 
-def _get_s1_composite(bbox: ee.Geometry, date_str: str, window_days: int):
+def _get_s1_composite(bbox: ee.Geometry, date_str: str, window_days: int, relative_orbit: int):
     """
     Return a Sentinel-1 GRD median composite (VV, VH, VH_VV) for the period.
     Applies linear-power averaging: composite in linear → convert back to dB.
@@ -174,6 +174,8 @@ def _get_s1_composite(bbox: ee.Geometry, date_str: str, window_days: int):
         .filter(ee.Filter.listContains("transmitterReceiverPolarisation", "VV"))
         .filter(ee.Filter.listContains("transmitterReceiverPolarisation", "VH"))
         .filter(ee.Filter.eq("instrumentMode", "IW"))
+        .filter(ee.Filter.eq("orbitProperties_pass", "DESCENDING"))
+        .filter(ee.Filter.eq("relativeOrbitNumber_start", relative_orbit))
         .select(["VV", "VH"])
     )
 
@@ -219,16 +221,19 @@ def fetch_imagery(
     init_ee()
 
     bbox = ee.Geometry.Rectangle([lon_min, lat_min, lon_max, lat_max])
+    center_lon = (float(lon_min) + float(lon_max)) / 2
+    output_crs = "EPSG:32643" if center_lon < 78 else "EPSG:32644"
+    relative_orbit = 136 if center_lon < 77 else 165
     out_h, out_w = _calculate_optimal_dimensions(lon_min, lat_min, lon_max, lat_max, base_dim=thumb_size)
     thumb_dim = f"{out_w}x{out_h}"
 
     # ── T1 composite ────────────────────────────────────────────────────────
     s2_t1, t1_count = _get_s2_composite(bbox, date_t1, window_days, max_cloud)
-    s1_t1 = _get_s1_composite(bbox, date_t1, window_days)
+    s1_t1 = _get_s1_composite(bbox, date_t1, window_days, relative_orbit)
 
     # ── T2 composite ────────────────────────────────────────────────────────
     s2_t2, t2_count = _get_s2_composite(bbox, date_t2, window_days, max_cloud)
-    s1_t2 = _get_s1_composite(bbox, date_t2, window_days)
+    s1_t2 = _get_s1_composite(bbox, date_t2, window_days, relative_orbit)
 
     # ── RGB thumbnails (B4=Red, B3=Green, B2=Blue) ──────────────────────────
     vis_rgb = {"bands": ["B4", "B3", "B2"], "min": 0, "max": 3000, "gamma": 1.4}
@@ -244,11 +249,23 @@ def fetch_imagery(
     t2_rgb_b64 = _url_to_b64(t2_thumb_url)
 
     # ── 17-channel numpy tensors ─────────────────────────────────────────────
-    t1_tensor = _build_tensor(s2_t1, s1_t1, bbox, thumb_size)
-    t2_tensor = _build_tensor(s2_t2, s1_t2, bbox, thumb_size)
+    t1_tensor = _build_tensor(s2_t1, s1_t1, bbox, output_crs)
+    t2_tensor = _build_tensor(s2_t2, s1_t2, bbox, output_crs)
+    if t1_tensor.shape != t2_tensor.shape:
+        raise RuntimeError("T1 and T2 acquisitions produced different output grids.")
 
     target = datetime.datetime.strptime(date_t1, "%Y-%m-%d")
     meta = {
+        "provider": "Google Earth Engine",
+        "s1_used": True,
+        "s1_note": "Sentinel-1 GRD VV/VH composite and VH_VV difference",
+        "crs": output_crs,
+        "relative_orbit": relative_orbit,
+        "orbit_pass": "DESCENDING",
+        "output_shape": list(t1_tensor.shape[1:]),
+        "pixel_resolution_m": 10,
+        "resolution_note": "GEE model inputs use a 10 m UTM grid; area values are approximate at bbox edges.",
+        "quality_channel": "clip(n_clear / 8, 0, 1)",
         "t1_date": date_t1,
         "t2_date": date_t2,
         "t1_window": f"{(target - datetime.timedelta(days=window_days)).strftime('%Y-%m-%d')} → "
@@ -261,18 +278,22 @@ def fetch_imagery(
     return {
         "t1_rgb_b64": t1_rgb_b64,
         "t2_rgb_b64": t2_rgb_b64,
-        "t1_tensor": t1_tensor,   # numpy [17, H, W] int16
+        "t1_tensor": t1_tensor,   # float32 [17, H, W], training scales retained
         "t2_tensor": t2_tensor,
         "meta": meta,
     }
 
 
-def _build_tensor(s2_img, s1_img, bbox, size: int) -> np.ndarray:
+def _build_tensor(s2_img, s1_img, bbox, output_crs: str) -> np.ndarray:
     """
-    Download a [17, size, size] int16 tensor from GEE.
+    Download the trained [17, H, W] contract on a 10 m UTM grid.
     Channel order: B2..B12(11) + NDVI + NDBI + VV + VH + VH_VV + Q(n_clear)
     """
     bands = S2_BANDS + ["NDVI", "NDBI", "VV", "VH", "VH_VV", "n_clear"]
+
+    area_m2 = float(bbox.area(maxError=1).getInfo())
+    if area_m2 / 100.0 > 400_000:
+        raise RuntimeError("Selected area exceeds the single-request 10 m model grid limit; select a smaller area.")
 
     # Combine S2 and S1 into one image
     combined = s2_img.addBands(s1_img)
@@ -280,9 +301,8 @@ def _build_tensor(s2_img, s1_img, bbox, size: int) -> np.ndarray:
     # Use getDownloadURL for numpy-compatible download
     url = combined.select(bands).getDownloadURL({
         "scale": 10,
-        "crs": "EPSG:4326",
+        "crs": output_crs,
         "region": bbox,
-        "dimensions": f"{size}x{size}",
         "format": "NPY",
     })
 
@@ -298,14 +318,19 @@ def _build_tensor(s2_img, s1_img, bbox, size: int) -> np.ndarray:
 
     stacked = np.stack(channels, axis=0)  # [17, H, W]
 
-    # Scale optical bands to int16 (ρ×10000)
-    stacked[:11] = np.clip(stacked[:11] * 10000, -32768, 32767)
-    # NDVI and NDBI are already in [-1,1] — keep as float, scale later
-    # SAR channels (VV, VH, VH_VV) — already in dB, scale ×100
-    stacked[13:16] = np.clip(stacked[13:16] * 100, -32768, 32767)
-    # Q (n_clear) — keep as is
+    return _encode_model_tensor(stacked)
 
-    return stacked.astype(np.int16)
+
+def _encode_model_tensor(raw: np.ndarray) -> np.ndarray:
+    """Convert raw GEE bands to training storage scales without quantizing floats."""
+    if raw.ndim != 3 or raw.shape[0] != 17:
+        raise ValueError("Expected 17 channels in manifest order.")
+    encoded = raw.astype(np.float32, copy=True)
+    # Earth Engine Sentinel-2 SR bands are already DN scaled by 10,000.
+    encoded[:11] = np.clip(encoded[:11], -32768, 32767)
+    encoded[13:16] = np.clip(encoded[13:16] * 100, -32768, 32767)
+    encoded[16] = np.clip(encoded[16] / 8.0, 0.0, 1.0)
+    return encoded
 
 
 def _url_to_b64(url: str) -> str:
