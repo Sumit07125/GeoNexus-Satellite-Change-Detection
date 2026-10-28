@@ -20,6 +20,7 @@ import inference
 import gee_config
 import gee_service
 import sentinel_stac_service as stac_service
+import gee_service
 from gee_service import _encode_model_tensor
 from diagnostics.region_pair_diagnostic import generate_candidates, run_diagnostic
 
@@ -57,6 +58,56 @@ class ReliabilityContractTests(unittest.TestCase):
         self.assertEqual(gee_config.classify_gee_error(RuntimeError("invalid_grant oauth token"))[0], "gee_authentication_failed")
         self.assertEqual(gee_config.classify_gee_error(RuntimeError("403 project permission denied"))[0], "gee_project_access_denied")
         self.assertEqual(gee_config.classify_gee_error(RuntimeError("No Sentinel-1 scenes"))[0], "gee_imagery_unavailable")
+
+    def test_shared_orbit_is_discovered_deterministically_for_both_dates(self):
+        t1 = {136: 8, 37: 5, 51: 5}
+        t2 = {136: 2, 37: 7, 51: 7}
+        selected, common, policy = gee_service.choose_shared_orbit(t1, t2)
+        self.assertEqual(common, [37, 51, 136])
+        self.assertEqual(selected, 37)  # ties in pair-minimum and total counts resolve to the lower orbit ID
+        self.assertIn("lowest orbit ID", policy)
+        self.assertEqual(gee_service.choose_shared_orbit(t1, t2)[0], gee_service.choose_shared_orbit(t1, t2)[0])
+
+    def test_orbit_seen_in_only_one_window_is_rejected_with_candidate_counts(self):
+        t1 = {136: 6}
+        t2 = {165: 4}
+        with self.assertRaises(gee_service.GEEAcquisitionError) as caught:
+            gee_service._select_shared_orbit(t1, t2, None, {"t1_s1_orbits": t1, "t2_s1_orbits": t2})
+        self.assertEqual(caught.exception.code, "gee_no_common_s1_orbit")
+        self.assertEqual(caught.exception.details["s1_common_orbits"], [])
+        self.assertIn("t1_s1_orbits", caught.exception.details)
+
+    def test_arbitrary_mumbai_box_uses_discovered_orbits_and_exact_research_zone_keeps_lock(self):
+        mumbai = (72.8432, 19.1113, 72.8527, 19.1203)
+        self.assertIsNone(gee_service._matches_research_zone(mumbai))
+        selected, _, _ = gee_service.choose_shared_orbit({37: 3}, {37: 2})
+        self.assertEqual(selected, 37)
+        self.assertEqual(gee_service._matches_research_zone((73.70, 18.30, 74.20, 18.80)), ("zone_a_pune", 136))
+        locked, _, reason = gee_service.choose_shared_orbit({136: 9, 37: 20}, {136: 4, 37: 20}, frozen_orbit=136)
+        self.assertEqual(locked, 136)
+        self.assertEqual(reason, "frozen research-zone orbit")
+
+    def test_stage_specific_s1_s2_and_cloud_score_failures_preserve_windows(self):
+        diagnostic = {"search_windows": {"t1": {"start": "2021-02-28", "end_inclusive": "2021-03-30"}}}
+        cases = [
+            (lambda: gee_service._require_s1_scenes("T1", 0, 0, {}, diagnostic), "gee_s1_no_scenes_t1"),
+            (lambda: gee_service._require_s2_scenes("T2", 0, 0, diagnostic), "gee_s2_no_scenes_t2"),
+            (lambda: gee_service._require_cloud_score_matches("T1", 0, diagnostic), "gee_cloud_score_no_coverage"),
+        ]
+        for operation, expected_code in cases:
+            with self.subTest(expected_code=expected_code), self.assertRaises(gee_service.GEEAcquisitionError) as caught:
+                operation()
+            self.assertEqual(caught.exception.code, expected_code)
+            self.assertIn("search_windows", caught.exception.details)
+
+    def test_small_ai_bbox_is_rejected_before_thread_or_satellite_acquisition(self):
+        small = {"bbox": {"lon_min": 72.8432, "lat_min": 19.1113, "lon_max": 72.8527, "lat_max": 19.1203}, "date_t1": "2021-03-15", "date_t2": "2024-03-15"}
+        with patch("app.threading.Thread") as thread:
+            response = self.client.post("/api/detect/start", json=small)
+        self.assertEqual(response.status_code, 422)
+        self.assertEqual(response.json["error_code"], "area_too_small")
+        self.assertLess(response.json["meta"]["estimated_bbox_dimensions_m"]["width"], 1280)
+        thread.assert_not_called()
 
     def test_gee_init_uses_configured_credentials_and_classifies_auth_failure(self):
         config = {"configured": True, "auth_method": "local_credentials"}
@@ -346,7 +397,7 @@ class ReliabilityContractTests(unittest.TestCase):
         self.assertEqual(api._jobs["stac-ai"]["status"], "error")
         self.assertEqual(api._jobs["stac-ai"]["error_code"], "gee_project_access_denied")
         self.assertEqual(api._jobs["stac-ai"]["meta"]["provider_attempts"][0]["provider"], "Google Earth Engine")
-        self.assertEqual(api._jobs["stac-ai"]["meta"]["diagnostic"]["dates"]["t1"], "2021-01-01")
+        self.assertEqual(api._jobs["stac-ai"]["meta"]["diagnostic"]["requested_dates"]["t1"], "2021-01-01")
 
     def test_ai_provider_failure_is_not_reported_as_provider_fallback(self):
         gee = types.ModuleType("gee_service")

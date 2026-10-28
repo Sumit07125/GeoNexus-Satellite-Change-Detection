@@ -21,10 +21,15 @@ _EE_INITIALIZED = False
 
 
 class GEEProviderError(Exception):
-    def __init__(self, code: str, message: str):
+    def __init__(self, code: str, message: str, details: dict | None = None):
         super().__init__(message)
         self.code = code
         self.message = message
+        self.details = details or {}
+
+
+class GEEAcquisitionError(GEEProviderError):
+    """A sanitized, stage-specific acquisition failure with bounded diagnostics."""
 
 
 def init_ee():
@@ -64,6 +69,123 @@ S2_BANDS = ["B2", "B3", "B4", "B5", "B6", "B7", "B8", "B8A", "B9", "B11", "B12"]
 # Channel order: 11 optical raw + NDVI + NDBI + VV + VH + VH_VV + Q
 CHANNEL_ORDER = [*S2_BANDS, "NDVI", "NDBI", "VV", "VH", "VH_VV", "Q"]
 
+RESEARCH_ORBIT_ZONES = {
+    "zone_a_pune": {"bbox": (73.70, 18.30, 74.20, 18.80), "orbit": 136},
+    "zone_b_satara": {"bbox": (73.50, 17.50, 74.00, 18.00), "orbit": 136},
+    "zone_c_vidarbha": {"bbox": (78.90, 20.90, 79.30, 21.30), "orbit": 165},
+}
+
+
+def _window_info(date_str: str, window_days: int) -> dict:
+    target = datetime.datetime.strptime(date_str, "%Y-%m-%d").date()
+    start = target - datetime.timedelta(days=window_days)
+    end_inclusive = target + datetime.timedelta(days=window_days)
+    return {
+        "start": start.isoformat(),
+        "end_inclusive": end_inclusive.isoformat(),
+        "end_exclusive": (end_inclusive + datetime.timedelta(days=1)).isoformat(),
+    }
+
+
+def _matches_research_zone(bbox: dict | tuple[float, ...]) -> tuple[str, int] | None:
+    values = tuple(float(bbox[k]) for k in ("lon_min", "lat_min", "lon_max", "lat_max")) if isinstance(bbox, dict) else tuple(map(float, bbox))
+    for zone, config in RESEARCH_ORBIT_ZONES.items():
+        if all(abs(a - b) <= 1e-5 for a, b in zip(values, config["bbox"])):
+            return zone, config["orbit"]
+    return None
+
+
+def choose_shared_orbit(t1_counts: dict[int, int], t2_counts: dict[int, int], frozen_orbit: int | None = None) -> tuple[int | None, list[int], str]:
+    """Choose one orbit present in both windows; prefer balanced, abundant coverage."""
+    common = sorted(set(t1_counts).intersection(t2_counts))
+    if frozen_orbit is not None:
+        if frozen_orbit in common:
+            return frozen_orbit, common, "frozen research-zone orbit"
+        return None, common, "frozen research-zone orbit unavailable in one or both windows"
+    if not common:
+        return None, common, "no common descending relative orbit"
+    selected = max(common, key=lambda orbit: (min(t1_counts[orbit], t2_counts[orbit]), t1_counts[orbit] + t2_counts[orbit], -orbit))
+    return selected, common, "maximum shared coverage: highest minimum scene count, then highest total count, then lowest orbit ID"
+
+
+def _require_s2_scenes(date_label: str, before_cloud_count: int, after_cloud_count: int, diagnostic: dict):
+    if before_cloud_count == 0 or after_cloud_count == 0:
+        reason = "no scenes in the requested window" if before_cloud_count == 0 else "all scenes were excluded by the scene cloud limit"
+        _raise_stage_error(
+            f"gee_s2_no_scenes_{date_label.lower()}",
+            f"No Sentinel-2 scenes were available for {date_label} after applying the requested window and cloud limit ({reason}).",
+            f"s2_{date_label.lower()}_scene_filter", diagnostic,
+        )
+
+
+def _require_s1_scenes(date_label: str, before_filters: int, after_filters: int, orbit_counts: dict[int, int], diagnostic: dict):
+    if before_filters == 0 or after_filters == 0 or not orbit_counts:
+        _raise_stage_error(
+            f"gee_s1_no_scenes_{date_label.lower()}",
+            f"No Sentinel-1 descending IW scenes with both VV and VH were available for {date_label} in the requested window.",
+            f"s1_{date_label.lower()}_scene_filter", diagnostic,
+        )
+
+
+def _require_cloud_score_matches(date_label: str, linked_scene_count: int, diagnostic: dict):
+    if linked_scene_count == 0:
+        _raise_stage_error(
+            "gee_cloud_score_no_coverage",
+            f"Sentinel-2 scenes exist for {date_label}, but none have a matching Cloud Score+ quality scene. Try different dates or a wider window.",
+            f"s2_{date_label.lower()}_cloud_score_link", diagnostic,
+        )
+
+
+def _select_shared_orbit(t1_counts: dict[int, int], t2_counts: dict[int, int], frozen_orbit: int | None, diagnostic: dict):
+    orbit, common, reason = choose_shared_orbit(t1_counts, t2_counts, frozen_orbit)
+    if orbit is None:
+        _raise_stage_error(
+            "gee_no_common_s1_orbit",
+            "No single descending Sentinel-1 relative orbit has valid VV/VH scenes in both requested date windows. Increase the temporal search window or choose different dates; the selected window was not changed.",
+            "s1_common_orbit_selection", {**diagnostic, "s1_common_orbits": common, "s1_orbit_selection_policy": reason, "selected_relative_orbit": None},
+        )
+    return orbit, common, reason
+
+
+def _safe_error_reason(error: Exception) -> str:
+    """Keep actionable stage diagnostics while removing paths, URLs and credentials."""
+    import re
+    reason = str(error)
+    reason = re.sub(r"(?i)bearer\s+[^\s,;]+", "Bearer [redacted]", reason)
+    reason = re.sub(r"(?i)(token|password|secret|credential|authorization)(\s*[=:]\s*)[^\s,;]+", r"\1\2[redacted]", reason)
+    reason = re.sub(r"(?i)https?://\S+", "[provider-url]", reason)
+    reason = re.sub(r"(?i)([a-z]:\\|/)(?:[^\s:]+[\\/])+[^\s:]*", "[path]", reason)
+    return reason[:240]
+
+
+def _diagnostic_base(date_t1: str, date_t2: str, window_days: int, max_cloud: int, bbox: tuple[float, ...]) -> dict:
+    return {
+        "provider": "Google Earth Engine",
+        "requested_dates": {"t1": date_t1, "t2": date_t2},
+        "search_windows": {"t1": _window_info(date_t1, window_days), "t2": _window_info(date_t2, window_days)},
+        "window_days": window_days,
+        "max_cloud_pct": max_cloud,
+        "bbox": list(bbox),
+    }
+
+
+def _raise_stage_error(code: str, message: str, stage: str, diagnostic: dict, error: Exception | None = None):
+    details = {**diagnostic, "stage": stage}
+    if error is not None:
+        if code in {"gee_api_unavailable", "gee_imagery_download_failed"}:
+            # Initialization alone does not prove project access. EE often
+            # authenticates lazily on the first collection request, so retain
+            # auth and authorization failures at their actual acquisition stage.
+            try:
+                from gee_config import classify_gee_error
+                classified_code, classified_message = classify_gee_error(error)
+                if classified_code in {"gee_authentication_failed", "gee_project_access_denied"}:
+                    code, message = classified_code, classified_message
+            except Exception:
+                pass
+        details.update({"exception_type": type(error).__name__, "technical_reason": _safe_error_reason(error)})
+    raise GEEAcquisitionError(code, message, details) from error
+
 
 def _scene_metadata(collection):
     """Return bounded, non-sensitive scene IDs and UTC acquisition timestamps."""
@@ -84,28 +206,57 @@ def _scene_metadata(collection):
     return scenes
 
 
-def _get_s2_composite(bbox: ee.Geometry, date_str: str, window_days: int, max_cloud: int):
+def _get_s2_composite(bbox: ee.Geometry, date_str: str, window_days: int, max_cloud: int, date_label: str, diagnostic: dict):
     """
-    Return the least-cloudy Sentinel-2 SR HARMONIZED composite within
-    ±window_days of date_str. Also return the n_clear observation count.
+    Return a median Sentinel-2 SR HARMONIZED composite within ±window_days,
+    plus the n_clear observation count used by the trained Q feature.
     """
     target = datetime.datetime.strptime(date_str, "%Y-%m-%d")
     start = (target - datetime.timedelta(days=window_days)).strftime("%Y-%m-%d")
     end = (target + datetime.timedelta(days=window_days + 1)).strftime("%Y-%m-%d")
 
-    col = (
+    base_col = (
         ee.ImageCollection("COPERNICUS/S2_SR_HARMONIZED")
         .filterBounds(bbox)
         .filterDate(start, end)
-        .filter(ee.Filter.lt("CLOUDY_PIXEL_PERCENTAGE", max_cloud))
     )
+    try:
+        before_cloud_count = int(base_col.size().getInfo())
+        col = base_col.filter(ee.Filter.lte("CLOUDY_PIXEL_PERCENTAGE", max_cloud))
+        after_cloud_count = int(col.size().getInfo())
+    except Exception as error:
+        _raise_stage_error("gee_api_unavailable", "Earth Engine could not query Sentinel-2 scenes. Check API/project access and retry.", f"s2_{date_label.lower()}_query", {**diagnostic, f"{date_label.lower()}_s2_count_before_cloud_filter": None, f"{date_label.lower()}_s2_count_after_cloud_filter": None}, error)
+
+    date_diag = {
+        **diagnostic,
+        f"{date_label.lower()}_s2_count_before_cloud_filter": before_cloud_count,
+        f"{date_label.lower()}_s2_count_after_cloud_filter": after_cloud_count,
+    }
+    _require_s2_scenes(date_label, before_cloud_count, after_cloud_count, date_diag)
 
     # Cloud Score+ masking
     # Match training preprocessing: link Cloud Score+ by source scene index.
     # Unmatched Cloud Score+ bands remain masked, so they cannot count as clear.
-    cloud_score = ee.ImageCollection("GOOGLE/CLOUD_SCORE_PLUS/V1/S2_HARMONIZED")
-    linked = col.linkCollection(cloud_score, ["cs_cdf"])
-    masked = linked.map(lambda img: img.updateMask(img.select("cs_cdf").gte(0.60)))
+    cloud_score = (
+        ee.ImageCollection("GOOGLE/CLOUD_SCORE_PLUS/V1/S2_HARMONIZED")
+        .filterBounds(bbox)
+        .filterDate(start, end)
+    )
+    try:
+        join = ee.Join.inner().apply(
+            primary=col,
+            secondary=cloud_score,
+            condition=ee.Filter.equals(leftField="system:index", rightField="system:index"),
+        )
+        linked_scene_count = int(join.size().getInfo())
+        linked = col.linkCollection(cloud_score, ["cs_cdf"])
+        masked = linked.map(lambda img: img.updateMask(img.select("cs_cdf").gte(0.60)))
+    except Exception as error:
+        _raise_stage_error("gee_api_unavailable", "Earth Engine could not link Cloud Score+ quality observations to Sentinel-2 scenes.", f"s2_{date_label.lower()}_cloud_score_link", {**date_diag, f"{date_label.lower()}_cloud_score_linked_scene_count": None}, error)
+
+    date_diag[f"{date_label.lower()}_cloud_score_linked_scene_count"] = linked_scene_count
+    date_diag[f"{date_label.lower()}_quality_filtering_unit"] = "per-pixel cs_cdf >= 0.60 mask; no scene-level removal"
+    _require_cloud_score_matches(date_label, linked_scene_count, date_diag)
 
     # n_clear: how many valid observations per pixel
     n_clear = masked.select("B4").count().rename("n_clear").unmask(0)
@@ -118,19 +269,47 @@ def _get_s2_composite(bbox: ee.Geometry, date_str: str, window_days: int, max_cl
     ndvi = b8.subtract(b4).divide(b8.add(b4).add(eps)).rename("NDVI")
     ndbi = b11.subtract(b8).divide(b11.add(b8).add(eps)).rename("NDBI")
 
-    scene_count = int(col.size().getInfo())
-    scenes = _scene_metadata(col) if scene_count else []
-    return composite.addBands([ndvi, ndbi, n_clear]), scene_count, scenes
+    try:
+        scenes = _scene_metadata(col)
+    except Exception as error:
+        _raise_stage_error("gee_api_unavailable", f"Earth Engine could not read Sentinel-2 acquisition metadata for {date_label}.", f"s2_{date_label.lower()}_metadata", date_diag, error)
+    date_diag[f"{date_label.lower()}_s2_scenes"] = scenes[:50]
+    return composite.addBands([ndvi, ndbi, n_clear]), after_cloud_count, scenes, date_diag
 
 
-def _get_s1_composite(bbox: ee.Geometry, date_str: str, window_days: int, relative_orbit: int):
-    """
-    Return a Sentinel-1 GRD median composite (VV, VH, VH_VV) for the period.
-    Applies linear-power averaging: composite in linear → convert back to dB.
-    """
+def _get_s1_orbit_candidates(bbox: ee.Geometry, date_str: str, window_days: int, date_label: str, diagnostic: dict):
+    """Query real descending IW dual-polarization S1 scenes and orbit counts."""
     target = datetime.datetime.strptime(date_str, "%Y-%m-%d")
     start = (target - datetime.timedelta(days=window_days)).strftime("%Y-%m-%d")
     end = (target + datetime.timedelta(days=window_days + 1)).strftime("%Y-%m-%d")
+
+    base = ee.ImageCollection("COPERNICUS/S1_GRD").filterBounds(bbox).filterDate(start, end)
+    try:
+        before_filters = int(base.size().getInfo())
+        eligible = (
+            base.filter(ee.Filter.listContains("transmitterReceiverPolarisation", "VV"))
+            .filter(ee.Filter.listContains("transmitterReceiverPolarisation", "VH"))
+            .filter(ee.Filter.eq("instrumentMode", "IW"))
+            .filter(ee.Filter.eq("orbitProperties_pass", "DESCENDING"))
+        )
+        after_filters = int(eligible.size().getInfo())
+        histogram = eligible.aggregate_histogram("relativeOrbitNumber_start").getInfo() or {}
+        orbit_counts = {int(orbit): int(count) for orbit, count in histogram.items()}
+    except Exception as error:
+        _raise_stage_error("gee_api_unavailable", f"Earth Engine could not query Sentinel-1 orbits for {date_label}.", f"s1_{date_label.lower()}_orbit_discovery", {**diagnostic, f"{date_label.lower()}_s1_count_before_filters": None, f"{date_label.lower()}_s1_count_after_iw_desc_vv_vh_filters": None, f"{date_label.lower()}_s1_orbits": {}}, error)
+
+    date_diag = {
+        **diagnostic,
+        f"{date_label.lower()}_s1_count_before_filters": before_filters,
+        f"{date_label.lower()}_s1_count_after_iw_desc_vv_vh_filters": after_filters,
+        f"{date_label.lower()}_s1_orbits": orbit_counts,
+    }
+    _require_s1_scenes(date_label, before_filters, after_filters, orbit_counts, date_diag)
+    return eligible, orbit_counts, date_diag
+
+
+def _get_s1_composite(eligible_collection, relative_orbit: int):
+    """Composite one selected orbit in linear power, then convert to dB."""
 
     def to_natural(img):
         return ee.Image(10).pow(img.divide(10))
@@ -138,21 +317,10 @@ def _get_s1_composite(bbox: ee.Geometry, date_str: str, window_days: int, relati
     def to_db(img):
         return img.log10().multiply(10)
 
-    col = (
-        ee.ImageCollection("COPERNICUS/S1_GRD")
-        .filterBounds(bbox)
-        .filterDate(start, end)
-        .filter(ee.Filter.listContains("transmitterReceiverPolarisation", "VV"))
-        .filter(ee.Filter.listContains("transmitterReceiverPolarisation", "VH"))
-        .filter(ee.Filter.eq("instrumentMode", "IW"))
-        .filter(ee.Filter.eq("orbitProperties_pass", "DESCENDING"))
-        .filter(ee.Filter.eq("relativeOrbitNumber_start", relative_orbit))
-        .select(["VV", "VH"])
-    )
-
+    col = eligible_collection.filter(ee.Filter.eq("relativeOrbitNumber_start", relative_orbit)).select(["VV", "VH"])
     scene_count = int(col.size().getInfo())
     if scene_count == 0:
-        raise RuntimeError(f"No Sentinel-1 scenes matched orbit {relative_orbit} for {date_str} ±{window_days} days.")
+        raise RuntimeError(f"Selected Sentinel-1 relative orbit {relative_orbit} unexpectedly has no scenes.")
 
     composite = to_db(col.map(to_natural).median())
     vv = composite.select("VV")
@@ -194,48 +362,118 @@ def fetch_imagery(
     max_cloud: int = 30,
     thumb_size: int = 512,
 ) -> dict:
-    init_ee()
+    coords = (float(lon_min), float(lat_min), float(lon_max), float(lat_max))
+    diagnostic = _diagnostic_base(date_t1, date_t2, int(window_days), int(max_cloud), coords)
+    lat_mid = (coords[1] + coords[3]) / 2
+    lat_rad = math.radians(lat_mid)
+    width_m = abs(coords[2] - coords[0]) * (111412.84 * math.cos(lat_rad) - 93.5 * math.cos(3 * lat_rad) + 0.118 * math.cos(5 * lat_rad))
+    height_m = abs(coords[3] - coords[1]) * (111132.92 - 559.82 * math.cos(2 * lat_rad) + 1.175 * math.cos(4 * lat_rad) - 0.0023 * math.cos(6 * lat_rad))
+    diagnostic["estimated_bbox_dimensions_m"] = {"width": round(width_m, 1), "height": round(height_m, 1)}
+    diagnostic["nominal_resolution_m"] = 10
+    diagnostic["estimated_10m_grid_shape"] = [round(height_m / 10), round(width_m / 10)]
+    if width_m < 1280 or height_m < 1280:
+        _raise_stage_error(
+            "area_too_small",
+            f"The selected area is approximately {width_m / 1000:.2f} km × {height_m / 1000:.2f} km. Geo-Nexus AI needs at least 1.28 km in both dimensions at 10 m resolution; enlarge the area before acquisition.",
+            "area_preflight", diagnostic,
+        )
 
-    bbox = ee.Geometry.Rectangle([lon_min, lat_min, lon_max, lat_max])
-    center_lon = (float(lon_min) + float(lon_max)) / 2
-    output_crs = "EPSG:32643" if center_lon < 78 else "EPSG:32644"
-    relative_orbit = 136 if center_lon < 77 else 165
+    try:
+        init_ee()
+    except Exception as error:
+        if getattr(error, "code", None):
+            _raise_stage_error(error.code, getattr(error, "message", str(error)), "gee_initialization", diagnostic, error)
+        from gee_config import classify_gee_error
+        code, message = classify_gee_error(error)
+        _raise_stage_error(code, message, "gee_initialization", diagnostic, error)
+
+    try:
+        bbox = ee.Geometry.Rectangle([lon_min, lat_min, lon_max, lat_max])
+        center_lon = (float(lon_min) + float(lon_max)) / 2
+        output_crs = "EPSG:32643" if center_lon < 78 else "EPSG:32644"
+    except Exception as error:
+        _raise_stage_error("gee_invalid_input_grid", "The selected bounds could not be represented on the model's projected grid.", "geometry_projection", diagnostic, error)
+
     out_h, out_w = _calculate_optimal_dimensions(lon_min, lat_min, lon_max, lat_max, base_dim=thumb_size)
     thumb_dim = f"{out_w}x{out_h}"
 
-    # ── T1 composite ────────────────────────────────────────────────────────
-    s2_t1, t1_count, t1_s2_scenes = _get_s2_composite(bbox, date_t1, window_days, max_cloud)
-    if t1_count == 0:
-        raise RuntimeError(f"No Sentinel-2 scenes matched the T1 window for {date_t1}.")
-    s1_t1, t1_s1_count, t1_s1_scenes = _get_s1_composite(bbox, date_t1, window_days, relative_orbit)
+    s2_t1, t1_count, t1_s2_scenes, t1_s2_diag = _get_s2_composite(bbox, date_t1, window_days, max_cloud, "T1", diagnostic)
+    s2_t2, t2_count, t2_s2_scenes, t2_s2_diag = _get_s2_composite(bbox, date_t2, window_days, max_cloud, "T2", diagnostic)
+    s1_t1_candidates, t1_orbits, t1_s1_diag = _get_s1_orbit_candidates(bbox, date_t1, window_days, "T1", diagnostic)
+    s1_t2_candidates, t2_orbits, t2_s1_diag = _get_s1_orbit_candidates(bbox, date_t2, window_days, "T2", diagnostic)
 
-    # ── T2 composite ────────────────────────────────────────────────────────
-    s2_t2, t2_count, t2_s2_scenes = _get_s2_composite(bbox, date_t2, window_days, max_cloud)
-    if t2_count == 0:
-        raise RuntimeError(f"No Sentinel-2 scenes matched the T2 window for {date_t2}.")
-    s1_t2, t2_s1_count, t2_s1_scenes = _get_s1_composite(bbox, date_t2, window_days, relative_orbit)
+    research_zone = _matches_research_zone(coords)
+    frozen_orbit = research_zone[1] if research_zone else None
+    relative_orbit, common_orbits, selection_reason = _select_shared_orbit(t1_orbits, t2_orbits, frozen_orbit, {**diagnostic, **t1_s1_diag, **t2_s1_diag, "research_zone": research_zone[0] if research_zone else None})
+    orbit_diagnostic = {
+        **diagnostic,
+        **t1_s1_diag,
+        **t2_s1_diag,
+        "s1_common_orbits": common_orbits,
+        "s1_orbit_selection_policy": selection_reason,
+        "research_zone": research_zone[0] if research_zone else None,
+        "selected_relative_orbit": relative_orbit,
+    }
+    try:
+        s1_t1, t1_s1_count, t1_s1_scenes = _get_s1_composite(s1_t1_candidates, relative_orbit)
+        s1_t2, t2_s1_count, t2_s1_scenes = _get_s1_composite(s1_t2_candidates, relative_orbit)
+    except Exception as error:
+        _raise_stage_error("gee_api_unavailable", "Earth Engine could not construct the selected common Sentinel-1 orbit composites.", "s1_composite", orbit_diagnostic, error)
+
+    acquisition_diagnostics = {
+        **diagnostic,
+        **t1_s2_diag,
+        **t2_s2_diag,
+        **t1_s1_diag,
+        **t2_s1_diag,
+        "s1_common_orbits": common_orbits,
+        "s1_orbit_selection_policy": selection_reason,
+        "research_zone": research_zone[0] if research_zone else None,
+        "selected_relative_orbit": relative_orbit,
+        "selected_s1_scenes": {"t1": t1_s1_scenes[:50], "t2": t2_s1_scenes[:50]},
+        "selected_s1_scene_counts": {"t1": t1_s1_count, "t2": t2_s1_count},
+        "crs": output_crs,
+        "nominal_resolution_m": 10,
+        "estimated_10m_grid_shape": diagnostic["estimated_10m_grid_shape"],
+    }
 
     # ── RGB thumbnails (B4=Red, B3=Green, B2=Blue) ──────────────────────────
     vis_rgb = {"bands": ["B4", "B3", "B2"], "min": 0, "max": 3000, "gamma": 1.4}
+    try:
+        t1_thumb_url = s2_t1.getThumbURL({**vis_rgb, "region": bbox, "dimensions": thumb_dim, "format": "png"})
+        t2_thumb_url = s2_t2.getThumbURL({**vis_rgb, "region": bbox, "dimensions": thumb_dim, "format": "png"})
+        t1_rgb_b64 = _url_to_b64(t1_thumb_url)
+        t2_rgb_b64 = _url_to_b64(t2_thumb_url)
+    except Exception as error:
+        _raise_stage_error("gee_imagery_download_failed", "Earth Engine imagery thumbnails could not be retrieved for the selected extent.", "thumbnail_download", {**acquisition_diagnostics, "requested_thumbnail_shape": [out_h, out_w]}, error)
 
-    t1_thumb_url = s2_t1.getThumbURL({
-        **vis_rgb, "region": bbox, "dimensions": thumb_dim, "format": "png"
-    })
-    t2_thumb_url = s2_t2.getThumbURL({
-        **vis_rgb, "region": bbox, "dimensions": thumb_dim, "format": "png"
-    })
-
-    t1_rgb_b64 = _url_to_b64(t1_thumb_url)
-    t2_rgb_b64 = _url_to_b64(t2_thumb_url)
-
-    # ── 17-channel numpy tensors ─────────────────────────────────────────────
-    t1_tensor, t1_quality_stats = _build_tensor(s2_t1, s1_t1, bbox, output_crs)
-    t2_tensor, t2_quality_stats = _build_tensor(s2_t2, s1_t2, bbox, output_crs)
+    try:
+        t1_tensor, t1_quality_stats = _build_tensor(s2_t1, s1_t1, bbox, output_crs)
+        t2_tensor, t2_quality_stats = _build_tensor(s2_t2, s1_t2, bbox, output_crs)
+    except Exception as error:
+        _raise_stage_error("gee_imagery_download_failed", "Earth Engine model-band download or array decoding failed. Check the selected extent, projection, and provider availability.", "model_tensor_download", acquisition_diagnostics, error)
     if t1_tensor.shape != t2_tensor.shape:
-        raise RuntimeError("T1 and T2 acquisitions produced different output grids.")
+        _raise_stage_error("gee_invalid_input_grid", "T1 and T2 downloads produced different raster grids.", "t1_t2_grid_alignment", {**acquisition_diagnostics, "t1_shape": list(t1_tensor.shape), "t2_shape": list(t2_tensor.shape)})
+    if t1_tensor.ndim != 3 or t1_tensor.shape[0] != len(CHANNEL_ORDER) or min(t1_tensor.shape[1:]) < 128:
+        _raise_stage_error(
+            "gee_invalid_input_grid",
+            "Earth Engine returned a model grid smaller than 128 × 128 pixels at the requested 10 m resolution. Enlarge the selected area and retry.",
+            "model_grid_validation",
+            {**acquisition_diagnostics, "output_grid_shape": list(t1_tensor.shape), "minimum_grid_shape": [128, 128]},
+        )
+
+    for date_label, stats in (("T1", t1_quality_stats), ("T2", t2_quality_stats)):
+        if stats.get("positive_fraction", 0) <= 0:
+            _raise_stage_error(
+                "gee_cloud_score_no_coverage",
+                f"Sentinel-2 scenes exist for {date_label}, but Cloud Score+ masking left no clear observations in the selected area.",
+                f"s2_{date_label.lower()}_quality_coverage",
+                {**acquisition_diagnostics, f"{date_label.lower()}_quality_raw_n_clear": stats},
+            )
 
     target_t1 = datetime.datetime.strptime(date_t1, "%Y-%m-%d")
     target_t2 = datetime.datetime.strptime(date_t2, "%Y-%m-%d")
+    acquisition_diagnostics["output_grid_shape"] = list(t1_tensor.shape[1:])
     meta = {
         "provider": "Google Earth Engine",
         "preprocessing_id": "gee_s2_s1_median_composite_v2",
@@ -244,6 +482,9 @@ def fetch_imagery(
         "s1_note": "Sentinel-1 GRD VV/VH composite and VH_VV difference",
         "crs": output_crs,
         "relative_orbit": relative_orbit,
+        "relative_orbit_selection_reason": selection_reason,
+        "s1_common_orbits": common_orbits,
+        "research_zone": research_zone[0] if research_zone else None,
         "orbit_pass": "DESCENDING",
         "output_shape": list(t1_tensor.shape[1:]),
         "pixel_resolution_m": 10,
@@ -266,15 +507,16 @@ def fetch_imagery(
         "t2_scene_count": t2_count,
         "t1_s1_scene_count": t1_s1_count,
         "t2_s1_scene_count": t2_s1_count,
-        "t1_s2_scenes": t1_s2_scenes,
-        "t2_s2_scenes": t2_s2_scenes,
-        "t1_s1_scenes": t1_s1_scenes,
-        "t2_s1_scenes": t2_s1_scenes,
-        "t1_acquisition_datetimes": [scene["acquisition_datetime"] for scene in t1_s2_scenes],
-        "t2_acquisition_datetimes": [scene["acquisition_datetime"] for scene in t2_s2_scenes],
-        "t1_s1_acquisition_datetimes": [scene["acquisition_datetime"] for scene in t1_s1_scenes],
-        "t2_s1_acquisition_datetimes": [scene["acquisition_datetime"] for scene in t2_s1_scenes],
+        "t1_s2_scenes": t1_s2_scenes[:50],
+        "t2_s2_scenes": t2_s2_scenes[:50],
+        "t1_s1_scenes": t1_s1_scenes[:50],
+        "t2_s1_scenes": t2_s1_scenes[:50],
+        "t1_acquisition_datetimes": [scene["acquisition_datetime"] for scene in t1_s2_scenes[:50]],
+        "t2_acquisition_datetimes": [scene["acquisition_datetime"] for scene in t2_s2_scenes[:50]],
+        "t1_s1_acquisition_datetimes": [scene["acquisition_datetime"] for scene in t1_s1_scenes[:50]],
+        "t2_s1_acquisition_datetimes": [scene["acquisition_datetime"] for scene in t2_s1_scenes[:50]],
         "provider_attempts": [{"provider": "Google Earth Engine", "status": "success"}],
+        "acquisition_diagnostics": acquisition_diagnostics,
         "window_days": window_days,
         "max_cloud_pct": max_cloud,
         "clear_score_threshold": 0.60,

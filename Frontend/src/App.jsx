@@ -11,6 +11,7 @@ import {
   findMatchingPrediction,
 } from './utils/storage';
 import { ANALYSIS_METHODS, DEFAULT_ANALYSIS_ENGINE } from './utils/analysisMethods';
+import { bboxDimensionsMeters, bboxDimensionsKm, createSquareBbox } from './utils/geospatial';
 
 const API = import.meta.env.VITE_API_URL || 'http://localhost:5000';
 
@@ -62,6 +63,7 @@ export default function App() {
   const [liveProgress, setLiveProgress] = useState('');
   const [error, setError] = useState(null);
   const [errorCode, setErrorCode] = useState(null);
+  const [errorMeta, setErrorMeta] = useState(null);
   const [result, setResult] = useState(null);
   const [apiStatus, setApiStatus] = useState('checking');
   const [geeStatus, setGeeStatus] = useState('checking');
@@ -180,17 +182,7 @@ export default function App() {
     setError(null);
     setErrorCode(null);
 
-    const latDelta = (size / 2) / 111.32;
-    const lonDelta = (size / 2) / (111.32 * Math.max(0.1, Math.cos((lat * Math.PI) / 180)));
-
-    const newBbox = {
-      lon_min: lon - lonDelta,
-      lat_min: lat - latDelta,
-      lon_max: lon + lonDelta,
-      lat_max: lat + latDelta,
-    };
-
-    setBbox(newBbox);
+    setBbox(createSquareBbox(lat, lon, size));
     if (!locationName) {
       setLocationName(`Location (${lat.toFixed(3)}°, ${lon.toFixed(3)}°)`);
     }
@@ -219,6 +211,14 @@ export default function App() {
     });
   };
 
+  const handleExpandAreaForAi = () => {
+    if (!bbox) return;
+    setBbox(createSquareBbox((bbox.lat_min + bbox.lat_max) / 2, (bbox.lon_min + bbox.lon_max) / 2, 1.4));
+    setError(null);
+    setErrorCode(null);
+    setErrorMeta(null);
+  };
+
   // ── Load cached prediction immediately ────────────────────────
   const handleLoadCachedPrediction = useCallback((cachedItem) => {
     const match = cachedItem || cachedMatch;
@@ -240,6 +240,13 @@ export default function App() {
     if (!bbox) { setError('Please select or enter coordinates for an area on the map.'); return; }
     if (!dateT1 || !dateT2) { setError('Please select both T1 and T2 dates.'); return; }
     if (dateT1 >= dateT2) { setError('T1 (Before) date must be earlier than T2 (After) date.'); return; }
+    const extent = bboxDimensionsMeters(bbox);
+    if (extent && (extent.width < 1280 || extent.height < 1280)) {
+      setError('This selected area is smaller than the Geo-Nexus AI minimum of 1.28 km in both dimensions at 10 m. Enlarge the area, or explicitly choose Spectral Analysis.');
+      setErrorCode('area_too_small');
+      setErrorMeta({ estimated_bbox_dimensions_m: { width: extent.width, height: extent.height } });
+      return;
+    }
 
     // If an identical prediction was already generated and saved, load instantly!
     if (cachedMatch && !bypassCache) {
@@ -249,6 +256,7 @@ export default function App() {
 
     setError(null);
     setErrorCode(null);
+    setErrorMeta(null);
     setResult(null);
     setSelectedPredictionId('active');
     setLiveProgress('Submitting satellite change detection job…');
@@ -294,6 +302,7 @@ export default function App() {
               clearTimeout(pollTimeout);
               const failure = new Error(statusData.error || 'Job failed on server');
               failure.code = statusData.error_code;
+              failure.meta = statusData.meta;
               reject(failure);
             }
           } catch (pollErr) {
@@ -336,6 +345,7 @@ export default function App() {
       const msg = err.response?.data?.error || err.message || 'Unexpected error';
       setError(msg);
       setErrorCode(err.response?.data?.error_code || err.code || null);
+      setErrorMeta(err.response?.data?.meta || err.meta || null);
     } finally {
       setLoading(false);
     }
@@ -355,6 +365,7 @@ export default function App() {
 
     setError(null);
     setErrorCode(null);
+    setErrorMeta(null);
     setResult(null);
     setSelectedPredictionId('active');
     setLiveProgress('Submitting enhanced spectral analysis job…');
@@ -426,6 +437,7 @@ export default function App() {
       const msg = err.response?.data?.error || err.message || 'Unexpected error';
       setError(msg);
       setErrorCode(err.response?.data?.error_code || err.code || null);
+      setErrorMeta(err.response?.data?.meta || err.meta || null);
     } finally {
       setLoading(false);
     }
@@ -471,6 +483,8 @@ export default function App() {
   }, []);
 
   const canAnalyze = bbox && dateT1 && dateT2 && !loading;
+  const bboxDimensions = bboxDimensionsKm(bbox);
+  const acquisitionDiagnostics = errorMeta?.diagnostic || {};
 
   return (
     <div className="app-wrapper">
@@ -742,6 +756,16 @@ export default function App() {
                         <span className="bbox-item-val">{bbox.lat_max.toFixed(4)}°</span>
                       </div>
                     </div>
+                    {bboxDimensions && (
+                      <div style={{ marginTop: '0.5rem', color: bboxDimensions.isSubModelMinimum ? 'var(--c-amber)' : 'var(--c-text2)', fontSize: '0.72rem', lineHeight: 1.5 }}>
+                        Actual extent: {bboxDimensions.widthKm.toFixed(2)} km × {bboxDimensions.heightKm.toFixed(2)} km · {bboxDimensions.areaKm2.toFixed(2)} km²
+                        {bboxDimensions.isSubModelMinimum && (
+                          <div style={{ marginTop: '0.35rem' }}>
+                            Smaller than AI's 1.28 km minimum. <button type="button" className="btn btn-ghost" style={{ padding: '0.2rem 0.45rem', fontSize: '0.7rem' }} onClick={handleExpandAreaForAi}>Expand to 1.4 km square</button>
+                          </div>
+                        )}
+                      </div>
+                    )}
                   </div>
                 ) : (
                   <div className="bbox-hint">
@@ -835,7 +859,7 @@ export default function App() {
                       type="number"
                       className="form-input"
                       value={windowDays}
-                      min={1} max={45}
+                      min={1} max={90}
                       onChange={(e) => setWindowDays(Number(e.target.value))}
                     />
                   </div>
@@ -869,6 +893,33 @@ export default function App() {
                   <p role="status" style={{ margin: 0, color: 'var(--c-text2)', fontSize: '0.78rem', lineHeight: 1.5 }}>
                     This trained AI model needs authenticated Google Earth Engine access to real Sentinel-1 and Sentinel-2 inputs. Configure GEE before retrying; spectral analysis remains available separately.
                   </p>
+                )}
+                {errorCode === 'gee_no_common_s1_orbit' && (
+                  <div role="status" style={{ color: 'var(--c-text2)', fontSize: '0.76rem', lineHeight: 1.55 }}>
+                    <div>T1 candidate orbit counts: {Object.keys(acquisitionDiagnostics.t1_s1_orbits || {}).length ? JSON.stringify(acquisitionDiagnostics.t1_s1_orbits) : 'none'}</div>
+                    <div>T2 candidate orbit counts: {Object.keys(acquisitionDiagnostics.t2_s1_orbits || {}).length ? JSON.stringify(acquisitionDiagnostics.t2_s1_orbits) : 'none'}</div>
+                    <div>Common orbits: {(acquisitionDiagnostics.s1_common_orbits || []).join(', ') || 'none'}. The selected dates and current window were preserved.</div>
+                    <div>Widen the search window or choose different dates, then retry AI.</div>
+                    <button type="button" className="btn btn-ghost" style={{ marginTop: '0.35rem', padding: '0.25rem 0.55rem', fontSize: '0.72rem' }} onClick={() => { setWindowDays((days) => Math.min(90, days + 15)); setError(null); setErrorCode(null); setErrorMeta(null); }}>Widen search window by 15 days</button>
+                  </div>
+                )}
+                {['gee_s1_no_scenes_t1', 'gee_s1_no_scenes_t2'].includes(errorCode) && (
+                  <div role="status" style={{ color: 'var(--c-text2)', fontSize: '0.76rem', lineHeight: 1.5 }}>
+                    Sentinel-1 stage: {acquisitionDiagnostics.stage || errorCode}. Candidate orbit counts: T1 {acquisitionDiagnostics.t1_s1_orbits ? (Object.keys(acquisitionDiagnostics.t1_s1_orbits).length ? JSON.stringify(acquisitionDiagnostics.t1_s1_orbits) : 'none') : 'not queried'}, T2 {acquisitionDiagnostics.t2_s1_orbits ? (Object.keys(acquisitionDiagnostics.t2_s1_orbits).length ? JSON.stringify(acquisitionDiagnostics.t2_s1_orbits) : 'none') : 'not queried'}.
+                  </div>
+                )}
+                {['gee_s2_no_scenes_t1', 'gee_s2_no_scenes_t2'].includes(errorCode) && (
+                  <div role="status" style={{ color: 'var(--c-text2)', fontSize: '0.76rem', lineHeight: 1.5 }}>
+                    Sentinel-2 counts before cloud filtering: T1 {acquisitionDiagnostics.t1_s2_count_before_cloud_filter ?? 'unknown'}, T2 {acquisitionDiagnostics.t2_s2_count_before_cloud_filter ?? 'unknown'}; after filtering: T1 {acquisitionDiagnostics.t1_s2_count_after_cloud_filter ?? 'unknown'}, T2 {acquisitionDiagnostics.t2_s2_count_after_cloud_filter ?? 'unknown'}.
+                  </div>
+                )}
+                {errorCode === 'gee_cloud_score_no_coverage' && (
+                  <div role="status" style={{ color: 'var(--c-text2)', fontSize: '0.76rem', lineHeight: 1.5 }}>
+                    Cloud Score+ coverage failed at {acquisitionDiagnostics.stage || 'quality filtering'}. Scene availability and quality matching are recorded separately.
+                  </div>
+                )}
+                {errorCode === 'area_too_small' && bbox && (
+                  <button type="button" className="btn btn-primary" onClick={handleExpandAreaForAi}>Expand selected area to 1.4 km square</button>
                 )}
                 <div style={{ display: 'flex', gap: '0.5rem', width: '100%' }}>
                   <button

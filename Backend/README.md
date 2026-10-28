@@ -77,6 +77,12 @@ Health check endpoint: `GET /api/health`
 
 Both start endpoints validate bbox coordinates, ordered ISO dates, cloud percentage, temporal search window, and engine-specific thresholds. The AI start endpoint checks project and credential configuration before queueing; authentication, project access, imagery availability, input validity, and strict model loading are checked during the job. GEE-to-STAC fallback is not used for AI. Successful responses include an engine ID, display label, algorithm/model version, threshold provenance, and imagery provider/acquisition metadata. Legacy database rows are retained with source `unknown`; cache matching is engine-specific.
 
+### Sentinel-1 orbit and area policy
+
+For the exact Pune, Satara, and Vidarbha research benchmark extents, the documented frozen relative orbits (136, 136, and 165) remain in force. Other AOIs query `COPERNICUS/S1_GRD` independently in each requested date window, retain descending IW scenes with VV and VH, and choose a single shared relative orbit. The selection is deterministic: maximize the lower of the T1/T2 scene counts, then total count, then prefer the lower orbit ID. If there is no common orbit, the AI job returns `gee_no_common_s1_orbit` with per-date orbit counts; it does not alter the requested window. Users may explicitly widen the temporal search window and retry.
+
+AI requests smaller than 1.28 km in either bbox dimension are rejected before a satellite job is queued. The downloaded T1/T2 grids are checked again for matching shapes and at least 128×128 pixels. Acquisition failures preserve a stage code and bounded diagnostics, including requested dates/windows, scene and orbit counts, Cloud Score+ matches, selected scene metadata, CRS/grid information when available, and a sanitized technical reason. The public job response omits stack traces and credentials. A successful local authentication check establishes account access only; it does not prove that the selected date windows contain suitable Sentinel-1/Sentinel-2 imagery. The deterministic test suite uses mocks and does not establish live imagery availability.
+
 ## Running Tests
 
 The deterministic API, model-input, provider separation, and storage-migration checks are located in `tests/`:

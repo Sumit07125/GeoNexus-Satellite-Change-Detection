@@ -49,6 +49,17 @@ class PipelineError(Exception):
 
 INPUT_CHANNEL_ORDER = ["B2", "B3", "B4", "B5", "B6", "B7", "B8", "B8A", "B9", "B11", "B12", "NDVI", "NDBI", "VV", "VH", "VH_VV", "Q"]
 QUALITY_STD_MIN = 0.5  # training applies its heterogeneity acceptance test to raw n_clear, before Q clipping
+AI_MIN_DIMENSION_M = 1280
+
+
+def _bbox_dimensions_m(bbox):
+    lat_mid = math.radians((bbox["lat_min"] + bbox["lat_max"]) / 2)
+    lat_scale = 111132.92 - 559.82 * math.cos(2 * lat_mid) + 1.175 * math.cos(4 * lat_mid) - 0.0023 * math.cos(6 * lat_mid)
+    lon_scale = 111412.84 * math.cos(lat_mid) - 93.5 * math.cos(3 * lat_mid) + 0.118 * math.cos(5 * lat_mid)
+    return {
+        "width": abs(bbox["lon_max"] - bbox["lon_min"]) * lon_scale,
+        "height": abs(bbox["lat_max"] - bbox["lat_min"]) * lat_scale,
+    }
 
 
 def _input_channel_diagnostics(imagery):
@@ -354,11 +365,19 @@ def _run_job(job_id: str, payload: dict):
                 code, message = gee_err.code, gee_err.message
             else:
                 code, message = classify_gee_error(gee_err)
-            attempt = {"provider": "Google Earth Engine", "status": code, "error_type": type(gee_err).__name__, "detail": message}
+            diagnostic = getattr(gee_err, "details", {}) or {}
+            attempt = {
+                "provider": "Google Earth Engine", "status": code,
+                "stage": diagnostic.get("stage", "acquisition"),
+                "error_type": type(gee_err).__name__, "detail": message,
+            }
             provider_attempts.append(attempt)
             meta["provider_attempts"] = provider_attempts
-            app.logger.warning("provider_attempt=%s", json.dumps({"job_id": job_id, **attempt}, separators=(",", ":")))
-            raise PipelineError(code, message, {"provider": "Google Earth Engine", "dates": {"t1": date_t1, "t2": date_t2}, "window_days": window_days, "max_cloud_pct": max_cloud}) from gee_err
+            app.logger.error("gee_acquisition_failure=%s", json.dumps({
+                "job_id": job_id, **attempt, "diagnostics": diagnostic,
+            }, separators=(",", ":")))
+            details = diagnostic or {"provider": "Google Earth Engine", "requested_dates": {"t1": date_t1, "t2": date_t2}, "window_days": window_days, "max_cloud_pct": max_cloud}
+            raise PipelineError(code, message, details) from gee_err
 
         meta["provider_attempts"] = provider_attempts
         meta["input_channels"] = 17
@@ -642,6 +661,15 @@ def detect_start():
     """
     try:
         body = _validate_payload(request.get_json(silent=True), "geonexus_ai")
+
+        dimensions = _bbox_dimensions_m(body["bbox"])
+        if dimensions["width"] < AI_MIN_DIMENSION_M or dimensions["height"] < AI_MIN_DIMENSION_M:
+            return jsonify({
+                "success": False,
+                "error": f"The selected area is about {dimensions['width'] / 1000:.2f} km × {dimensions['height'] / 1000:.2f} km. Geo-Nexus AI needs at least 1.28 km in both dimensions at 10 m resolution. Enlarge the area and retry.",
+                "error_code": "area_too_small",
+                "meta": {"estimated_bbox_dimensions_m": dimensions, "required_minimum_dimensions_m": {"width": AI_MIN_DIMENSION_M, "height": AI_MIN_DIMENSION_M}, "bbox": body["bbox"], "requested_dates": {"t1": body["date_t1"], "t2": body["date_t2"]}},
+            }), 422
 
         readiness = get_gee_configuration()
         if not readiness.get("configured"):

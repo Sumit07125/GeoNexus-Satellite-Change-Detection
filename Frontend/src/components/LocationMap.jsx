@@ -2,6 +2,7 @@ import React, { useState } from 'react';
 import { MapContainer, TileLayer, Rectangle, useMapEvents, useMap } from 'react-leaflet';
 import 'leaflet/dist/leaflet.css';
 import L from 'leaflet';
+import { bboxDimensionsKm, createSquareBbox } from '../utils/geospatial';
 
 // Fix Leaflet default icon paths broken by Vite
 delete L.Icon.Default.prototype._getIconUrl;
@@ -17,13 +18,8 @@ const MAP_ZOOM = 8;
 /* Calculate ground dimensions in kilometers and meters */
 function getBBoxDimensions(b) {
   if (!b) return null;
-  const latSpanDeg = Math.abs(b.lat_max - b.lat_min);
-  const lonSpanDeg = Math.abs(b.lon_max - b.lon_min);
-  const midLatRad = (((b.lat_min + b.lat_max) / 2) * Math.PI) / 180;
-
-  const heightKm = latSpanDeg * 111.32;
-  const widthKm = lonSpanDeg * 111.32 * Math.cos(midLatRad);
-  const areaKm2 = heightKm * widthKm;
+  const dimensions = bboxDimensionsKm(b);
+  const { widthKm, heightKm, areaKm2 } = dimensions;
 
   const formatDist = (km) => {
     if (km < 1.0) {
@@ -47,6 +43,7 @@ function getBBoxDimensions(b) {
     formattedHeight: formatDist(heightKm),
     formattedArea: formatArea(areaKm2),
     isSub2Km: widthKm < 2.0 || heightKm < 2.0,
+    isSubModelMinimum: dimensions.isSubModelMinimum,
   };
 }
 
@@ -125,14 +122,7 @@ function MapControls({ setBbox, drawing, setDrawing, bbox, hoverDims }) {
 
   const setPresetCenterBox = (sizeKm) => {
     const center = map.getCenter();
-    const latDelta = (sizeKm / 2) / 111.32;
-    const lonDelta = (sizeKm / 2) / (111.32 * Math.max(0.1, Math.cos((center.lat * Math.PI) / 180)));
-    setBbox({
-      lon_min: center.lng - lonDelta,
-      lat_min: center.lat - latDelta,
-      lon_max: center.lng + lonDelta,
-      lat_max: center.lat + latDelta,
-    });
+    setBbox(createSquareBbox(center.lat, center.lng, sizeKm));
     setDrawing(false);
   };
 
