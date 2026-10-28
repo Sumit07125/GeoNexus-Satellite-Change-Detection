@@ -1,0 +1,89 @@
+{
+  "schema_version": "1.0",
+  "project": "Geo-Nexus v3.2",
+  "dataset_id": "sumit07125/geonexus-p4b-v6-model-artifacts",
+  "dataset_title": "Geo-Nexus P4b V6 Model Artifacts",
+  "task": "binary bi-temporal change detection",
+  "input_contract": {
+    "timestamps": 2,
+    "channels_per_timestamp": 17,
+    "patch_size": 128,
+    "channel_order": [
+      "B2",
+      "B3",
+      "B4",
+      "B5",
+      "B6",
+      "B7",
+      "B8",
+      "B8A",
+      "B9",
+      "B11",
+      "B12",
+      "NDVI",
+      "NDBI",
+      "VV",
+      "VH",
+      "VH_VV",
+      "Q"
+    ],
+    "normalization_file": "norm_stats_trainonly.json"
+  },
+  "models": {
+    "geonexus_v3_2_p4b_k2": {
+      "checkpoint": "mh_fewshot_k2.pth",
+      "protocol": "P4b few-shot Maharashtra",
+      "adapt_patches": 2,
+      "supports_maharashtra": true,
+      "supports_oscd": false
+    },
+    "geonexus_v3_2_p4b_k3": {
+      "checkpoint": "mh_fewshot_k3.pth",
+      "protocol": "P4b few-shot Maharashtra",
+      "adapt_patches": 3,
+      "supports_maharashtra": true,
+      "supports_oscd": false
+    },
+    "geonexus_v3_2_p4b_k5": {
+      "checkpoint": "mh_fewshot_k5.pth",
+      "protocol": "P4b few-shot Maharashtra",
+      "adapt_patches": 5,
+      "supports_maharashtra": true,
+      "supports_oscd": false
+    },
+    "geonexus_v3_2_p4b_k10": {
+      "checkpoint": "mh_fewshot_k10.pth",
+      "protocol": "P4b few-shot Maharashtra",
+      "adapt_patches": 10,
+      "supports_maharashtra": true,
+      "supports_oscd": false
+    },
+    "geonexus_v3_2_p4b_k20": {
+      "checkpoint": "mh_fewshot_k20.pth",
+      "protocol": "P4b few-shot Maharashtra",
+      "adapt_patches": 20,
+      "supports_maharashtra": true,
+      "supports_oscd": false
+    },
+    "geonexus_v3_2_p4b_k30": {
+      "checkpoint": "mh_fewshot_k30.pth",
+      "protocol": "P4b few-shot Maharashtra",
+      "adapt_patches": 30,
+      "supports_maharashtra": true,
+      "supports_oscd": false
+    }
+  },
+  "best_model": {
+    "model_id": "geonexus_v3_2_p4b_best_k30",
+    "checkpoint": "mh_fewshot_best_k30.pth",
+    "base_protocol": "P4b few-shot Maharashtra",
+    "best_k_selected_from": "MH-VAL F1 only",
+    "k": 30,
+    "supports_maharashtra": true,
+    "supports_oscd": false
+  },
+  "foundation": {
+    "p3_architecture": "p3_geonexus_model.py",
+    "p3_checkpoint": "geonexus_v3_2_p3_oscd_model.pth"
+  }
+}

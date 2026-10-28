@@ -1,0 +1,32 @@
+{
+  "model_id": "geonexus_v3_2_k30",
+  "display_name": "Geo-Nexus v3.2 — Few-Shot k=30",
+  "version": "3.2.0",
+  "checkpoint": "mh_fewshot_best_k30.pth",
+  "architecture": "p3_geonexus_model.py",
+  "normalization": "norm_stats_trainonly.json",
+  "input_channels": 17,
+  "patch_size": 128,
+  "channel_order": [
+    "B2","B3","B4","B5","B6","B7","B8","B8A","B9","B11","B12",
+    "NDVI","NDBI","VV","VH","VH_VV","Q"
+  ],
+  "input_modalities": ["Sentinel-2", "Sentinel-1"],
+  "task": "binary_change_detection",
+  "threshold": 0.28,
+  "threshold_source": "P4b k=30 MH-VAL calibration",
+  "mode": "gated",
+  "supports_oscd": false,
+  "supports_maharashtra": true,
+  "training": "Few-shot Maharashtra adaptation (k=30 verified patches)",
+  "sensors": "Sentinel-1 + Sentinel-2",
+  "metrics": {
+    "mh_test_f1": 0.6369,
+    "mh_test_iou": 0.4673,
+    "mh_test_ap": 0.6996,
+    "mh_val_f1": 0.7394,
+    "best_k": 30,
+    "dataset": "Maharashtra (110 test patches)",
+    "warning": "Research evaluation metrics. Production accuracy depends on domain match, acquisition conditions, and preprocessing consistency."
+  }
+}

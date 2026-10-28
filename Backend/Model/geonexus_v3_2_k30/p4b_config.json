@@ -1,0 +1,27 @@
+{
+  "k_values": [
+    2,
+    3,
+    5,
+    10,
+    20,
+    30
+  ],
+  "batch_size": 4,
+  "encoder_lr_optical": 5e-06,
+  "encoder_lr_sar": 5e-06,
+  "decoder_lr": 2e-05,
+  "gate_lr": 0.0001,
+  "gate_loss_weight": 0.05,
+  "deep_supervision": [
+    1.0,
+    0.5,
+    0.25
+  ],
+  "early_stop_patience": 8,
+  "max_epochs": 30,
+  "amp": false,
+  "train_precision": "fp32",
+  "seed": 20260922,
+  "label_ignore": 255
+}

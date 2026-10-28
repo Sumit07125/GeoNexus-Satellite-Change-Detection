@@ -1,0 +1,39 @@
+{
+  "package": "GeoNexus_OSCD_Pipeline_v3.2_FINAL",
+  "files": [
+    ".gitignore",
+    "CHANGELOG.md",
+    "COMMANDS.md",
+    "KAGGLE_UPLOAD.md",
+    "PACKAGE_MANIFEST.json",
+    "README.md",
+    "RESEARCH_NOTES.md",
+    "RUN_PIPELINE.ps1",
+    "VALIDATION.md",
+    "audit_oscd_values.py",
+    "build_oscd_manifest.py",
+    "prepare_oscd.py",
+    "requirements.txt",
+    "run_pipeline.py",
+    "self_test.py",
+    "stage_kaggle_oscd.py",
+    "validate_prepared.py",
+    "verify_oscd.py"
+  ],
+  "validation": {
+    "py_compile": "PASS",
+    "self_test": "PASS",
+    "synthetic_end_to_end_6_of_6": "PASS",
+    "synthetic_33758_overflow_case": "PASS",
+    "kaggle_stage_dry_run": "PASS"
+  },
+  "contract": {
+    "patch": 128,
+    "train_stride": 64,
+    "eval_stride": 128,
+    "channels": 17,
+    "split": "11/3/10",
+    "storage": "int16 x10000",
+    "labels": "uint8 0/1"
+  }
+}

@@ -1,0 +1,17 @@
+.env
+__pycache__/
+*.py[cod]
+# PyTorch weights (tracked via Git LFS in root .gitattributes)
+*.pth
+!mh_fewshot_best_k30.pth
+*.pth.tar
+venv/
+.venv/
+env/
+tmp/
+*.log
+.earthengine/
+*.egg-info/
+dist/
+build/
+.pytest_cache/

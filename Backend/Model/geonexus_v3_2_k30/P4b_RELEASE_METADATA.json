@@ -1,0 +1,32 @@
+{
+  "release_name": "Geo-Nexus P4b V6 Model Artifacts",
+  "dataset_id": "sumit07125/geonexus-p4b-v6-model-artifacts",
+  "revision": "V6",
+  "source_datasets": [
+    "sumit07125/geonexus-p3-oscd-artifacts",
+    "sumit07125/geonexus-mh-p4-eval-v3-2"
+  ],
+  "test_scope": {
+    "total": 110,
+    "pune": 40,
+    "satara": 40,
+    "vidarbha": 30
+  },
+  "mh_adapt_count": 30,
+  "mh_val_count": 30,
+  "k_values": [
+    2,
+    3,
+    5,
+    10,
+    20,
+    30
+  ],
+  "best_k_selected_from": "MH-VAL only",
+  "best_k": 30,
+  "ignore_label": 255,
+  "training_precision": "FP32",
+  "inference_policy": "GPU FP32 with CPU float64 retry only for non-finite GPU inference batches",
+  "publication_method": "kagglehub.dataset_upload with Kaggle CLI fallback",
+  "created_utc": "2026-09-24T17:19:40Z"
+}
