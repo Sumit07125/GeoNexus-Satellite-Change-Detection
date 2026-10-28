@@ -124,32 +124,24 @@ def _get_s2_composite(bbox: ee.Geometry, date_str: str, window_days: int, max_cl
     )
 
     # Cloud Score+ masking
-    cs_col = (
-        ee.ImageCollection("GOOGLE/CLOUD_SCORE_PLUS/V1/S2_HARMONIZED")
-        .filterBounds(bbox)
-        .filterDate(start, end)
-    )
-
-    def mask_clouds(img):
-        cs = cs_col.filter(
-            ee.Filter.equals("system:index", img.get("system:index"))
-        ).first()
-        mask = cs.select("cs_cdf").gte(0.60)
-        return img.updateMask(mask)
-
-    masked = col.map(mask_clouds)
+    # Match training preprocessing: link Cloud Score+ by source scene index.
+    # Unmatched Cloud Score+ bands remain masked, so they cannot count as clear.
+    cloud_score = ee.ImageCollection("GOOGLE/CLOUD_SCORE_PLUS/V1/S2_HARMONIZED")
+    linked = col.linkCollection(cloud_score, ["cs_cdf"])
+    masked = linked.map(lambda img: img.updateMask(img.select("cs_cdf").gte(0.60)))
 
     # n_clear: how many valid observations per pixel
-    n_clear = masked.select("B4").count().rename("n_clear")
+    n_clear = masked.select("B4").count().rename("n_clear").unmask(0)
 
     composite = masked.select(S2_BANDS).median()
 
     # Add NDVI and NDBI
     eps = 1e-6
-    ndvi = composite.normalizedDifference(["B8", "B4"]).rename("NDVI")
-    ndbi = composite.normalizedDifference(["B11", "B8"]).rename("NDBI")
+    b8, b4, b11 = composite.select("B8"), composite.select("B4"), composite.select("B11")
+    ndvi = b8.subtract(b4).divide(b8.add(b4).add(eps)).rename("NDVI")
+    ndbi = b11.subtract(b8).divide(b11.add(b8).add(eps)).rename("NDBI")
 
-    return composite.addBands([ndvi, ndbi, n_clear]), col.size().getInfo()
+    return composite.addBands([ndvi, ndbi, n_clear]), int(col.size().getInfo())
 
 
 def _get_s1_composite(bbox: ee.Geometry, date_str: str, window_days: int, relative_orbit: int):
@@ -179,12 +171,16 @@ def _get_s1_composite(bbox: ee.Geometry, date_str: str, window_days: int, relati
         .select(["VV", "VH"])
     )
 
+    scene_count = int(col.size().getInfo())
+    if scene_count == 0:
+        raise RuntimeError(f"No Sentinel-1 scenes matched orbit {relative_orbit} for {date_str} ±{window_days} days.")
+
     composite = to_db(col.map(to_natural).median())
     vv = composite.select("VV")
     vh = composite.select("VH")
     vhvv = vh.subtract(vv).rename("VH_VV")
 
-    return composite.addBands(vhvv)
+    return composite.addBands(vhvv), scene_count
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -229,11 +225,15 @@ def fetch_imagery(
 
     # ── T1 composite ────────────────────────────────────────────────────────
     s2_t1, t1_count = _get_s2_composite(bbox, date_t1, window_days, max_cloud)
-    s1_t1 = _get_s1_composite(bbox, date_t1, window_days, relative_orbit)
+    if t1_count == 0:
+        raise RuntimeError(f"No Sentinel-2 scenes matched the T1 window for {date_t1}.")
+    s1_t1, t1_s1_count = _get_s1_composite(bbox, date_t1, window_days, relative_orbit)
 
     # ── T2 composite ────────────────────────────────────────────────────────
     s2_t2, t2_count = _get_s2_composite(bbox, date_t2, window_days, max_cloud)
-    s1_t2 = _get_s1_composite(bbox, date_t2, window_days, relative_orbit)
+    if t2_count == 0:
+        raise RuntimeError(f"No Sentinel-2 scenes matched the T2 window for {date_t2}.")
+    s1_t2, t2_s1_count = _get_s1_composite(bbox, date_t2, window_days, relative_orbit)
 
     # ── RGB thumbnails (B4=Red, B3=Green, B2=Blue) ──────────────────────────
     vis_rgb = {"bands": ["B4", "B3", "B2"], "min": 0, "max": 3000, "gamma": 1.4}
@@ -249,15 +249,18 @@ def fetch_imagery(
     t2_rgb_b64 = _url_to_b64(t2_thumb_url)
 
     # ── 17-channel numpy tensors ─────────────────────────────────────────────
-    t1_tensor = _build_tensor(s2_t1, s1_t1, bbox, output_crs)
-    t2_tensor = _build_tensor(s2_t2, s1_t2, bbox, output_crs)
+    t1_tensor, t1_quality_stats = _build_tensor(s2_t1, s1_t1, bbox, output_crs)
+    t2_tensor, t2_quality_stats = _build_tensor(s2_t2, s1_t2, bbox, output_crs)
     if t1_tensor.shape != t2_tensor.shape:
         raise RuntimeError("T1 and T2 acquisitions produced different output grids.")
 
-    target = datetime.datetime.strptime(date_t1, "%Y-%m-%d")
+    target_t1 = datetime.datetime.strptime(date_t1, "%Y-%m-%d")
+    target_t2 = datetime.datetime.strptime(date_t2, "%Y-%m-%d")
     meta = {
         "provider": "Google Earth Engine",
+        "preprocessing_id": "gee_s2_s1_median_composite_v2",
         "s1_used": True,
+        "sar_channels_available": True,
         "s1_note": "Sentinel-1 GRD VV/VH composite and VH_VV difference",
         "crs": output_crs,
         "relative_orbit": relative_orbit,
@@ -266,12 +269,27 @@ def fetch_imagery(
         "pixel_resolution_m": 10,
         "resolution_note": "GEE model inputs use a 10 m UTM grid; area values are approximate at bbox edges.",
         "quality_channel": "clip(n_clear / 8, 0, 1)",
+        "quality_channel_status": "real",
+        "quality_channel_source": "per-pixel count of Sentinel-2 B4 observations after linked Cloud Score+ cs_cdf >= 0.60 masking, divided by 8 and clipped to [0,1]",
+        "t1_quality_raw_stats": t1_quality_stats,
+        "t2_quality_raw_stats": t2_quality_stats,
+        "cloud_score_join": "Cloud Score+ linked by source system:index; unmatched quality bands remain masked",
+        "s2_collection": "COPERNICUS/S2_SR_HARMONIZED",
+        "s1_collection": "COPERNICUS/S1_GRD",
         "t1_date": date_t1,
         "t2_date": date_t2,
-        "t1_window": f"{(target - datetime.timedelta(days=window_days)).strftime('%Y-%m-%d')} → "
-                     f"{(target + datetime.timedelta(days=window_days)).strftime('%Y-%m-%d')}",
+        "t1_window": f"{(target_t1 - datetime.timedelta(days=window_days)).strftime('%Y-%m-%d')} → "
+                     f"{(target_t1 + datetime.timedelta(days=window_days)).strftime('%Y-%m-%d')}",
+        "t2_window": f"{(target_t2 - datetime.timedelta(days=window_days)).strftime('%Y-%m-%d')} → "
+                     f"{(target_t2 + datetime.timedelta(days=window_days)).strftime('%Y-%m-%d')}",
         "t1_scene_count": t1_count,
         "t2_scene_count": t2_count,
+        "t1_s1_scene_count": t1_s1_count,
+        "t2_s1_scene_count": t2_s1_count,
+        "window_days": window_days,
+        "max_cloud_pct": max_cloud,
+        "clear_score_threshold": 0.60,
+        "input_channel_order": CHANNEL_ORDER,
         "bbox": [lon_min, lat_min, lon_max, lat_max],
     }
 
@@ -284,10 +302,11 @@ def fetch_imagery(
     }
 
 
-def _build_tensor(s2_img, s1_img, bbox, output_crs: str) -> np.ndarray:
+def _build_tensor(s2_img, s1_img, bbox, output_crs: str) -> tuple[np.ndarray, dict]:
     """
-    Download the trained [17, H, W] contract on a 10 m UTM grid.
+    Download the trained [17, H, W] contract and raw n_clear stats on a 10 m UTM grid.
     Channel order: B2..B12(11) + NDVI + NDBI + VV + VH + VH_VV + Q(n_clear)
+    Returns (encoded_tensor, raw_n_clear_statistics).
     """
     bands = S2_BANDS + ["NDVI", "NDBI", "VV", "VH", "VH_VV", "n_clear"]
 
@@ -318,7 +337,18 @@ def _build_tensor(s2_img, s1_img, bbox, output_crs: str) -> np.ndarray:
 
     stacked = np.stack(channels, axis=0)  # [17, H, W]
 
-    return _encode_model_tensor(stacked)
+    quality = stacked[16]
+    finite_quality = quality[np.isfinite(quality)]
+    quality_stats = {
+        "source_feature": "n_clear before Q scaling/clipping",
+        "valid_pixel_fraction": float(np.isfinite(quality).mean()),
+        "positive_fraction": float((quality > 0).mean()),
+        "min": float(finite_quality.min()) if finite_quality.size else None,
+        "max": float(finite_quality.max()) if finite_quality.size else None,
+        "mean": float(finite_quality.mean()) if finite_quality.size else None,
+        "std": float(finite_quality.std()) if finite_quality.size else None,
+    }
+    return _encode_model_tensor(stacked), quality_stats
 
 
 def _encode_model_tensor(raw: np.ndarray) -> np.ndarray:

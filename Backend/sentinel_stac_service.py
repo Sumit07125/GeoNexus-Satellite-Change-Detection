@@ -483,6 +483,7 @@ def fetch_imagery(
 
     meta = {
         "provider": "Sentinel-2 STAC",
+        "preprocessing_id": "stac_s2_single_scene_spectral_only_v1",
         "source": "Sentinel-2 L2A (European Space Agency / Open Data)",
         "t1_scene_id": item_t1.id,
         "t1_cloud_pct": item_t1.properties.get("eo:cloud_cover", "N/A"),
@@ -492,6 +493,10 @@ def fetch_imagery(
         "t2_datetime": str(item_t2.datetime or item_t2.properties.get("datetime", "")),
         "s1_used": False,
         "sar_channels_available": False,
+        "quality_channel": "unavailable_placeholder",
+        "quality_channel_status": "placeholder",
+        "quality_channel_source": "no STAC Sentinel-1 or trained composite quality data; tensor slot is a placeholder and is invalid for AI",
+        "input_channel_order": ["B2", "B3", "B4", "B5", "B6", "B7", "B8", "B8A", "B9", "B11", "B12", "NDVI", "NDBI", "VV", "VH", "VH_VV", "Q"],
         "s1_note": "STAC result is Sentinel-2 only; SAR and Q tensor slots are placeholders and are invalid for AI inference.",
         "crs": "EPSG:4326",
         "output_shape": [int(target_shape[0]), int(target_shape[1])],

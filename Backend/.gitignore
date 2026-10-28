@@ -11,6 +11,8 @@ env/
 tmp/
 *.log
 .earthengine/
+diagnostics/private_config.json
+diagnostics/output/
 *.egg-info/
 dist/
 build/

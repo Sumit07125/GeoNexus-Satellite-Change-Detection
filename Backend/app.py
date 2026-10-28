@@ -12,6 +12,7 @@ import threading
 import traceback
 import math
 import re
+import json
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 from dotenv import load_dotenv
@@ -42,9 +43,75 @@ _jobs_lock = threading.Lock()
 
 class PipelineError(Exception):
     """Safe, structured pipeline failure suitable for job polling clients."""
-    def __init__(self, code: str, message: str):
+    def __init__(self, code: str, message: str, details: dict | None = None):
         super().__init__(message)
         self.code = code
+        self.details = details or {}
+
+
+INPUT_CHANNEL_ORDER = ["B2", "B3", "B4", "B5", "B6", "B7", "B8", "B8A", "B9", "B11", "B12", "NDVI", "NDBI", "VV", "VH", "VH_VV", "Q"]
+QUALITY_STD_MIN = 0.5  # training applies its heterogeneity acceptance test to raw n_clear, before Q clipping
+
+
+def _input_channel_diagnostics(imagery):
+    """Build bounded per-channel summaries; never include raster values or arrays."""
+    import numpy as np
+
+    meta = imagery.get("meta") or {}
+    provider = meta.get("provider", "unknown")
+    preprocessing = meta.get("preprocessing_id", "unknown")
+    rows = []
+    for date_key, tensor_key in (("t1", "t1_tensor"), ("t2", "t2_tensor")):
+        image = imagery.get(tensor_key)
+        date = meta.get(f"{date_key}_date") or meta.get(f"{date_key}_datetime") or "unknown"
+        if image is None or getattr(image, "ndim", 0) != 3:
+            rows.append({"date": date, "provider": provider, "preprocessing_id": preprocessing, "error": "missing_or_invalid_tensor"})
+            continue
+        for index, name in enumerate(INPUT_CHANNEL_ORDER[:image.shape[0]]):
+            values = np.asarray(image[index])
+            finite = np.isfinite(values)
+            finite_values = values[finite]
+            if index < 11:
+                valid = finite & (values > 0)
+            elif index < 13:
+                valid = finite & (np.abs(values) <= 1.0)
+            elif index < 16:
+                valid = finite & (values != 0)
+            else:
+                valid = finite & (values >= 0) & (values <= 1) & (values > 0)
+            if index in (13, 14, 15) and not meta.get("s1_used", False):
+                feature_status = "placeholder" if meta.get("sar_channels_available") is False else "unavailable"
+            elif index == 16 and meta.get("quality_channel_status") in ("placeholder", "unavailable"):
+                feature_status = meta["quality_channel_status"]
+            elif provider == "unknown":
+                feature_status = "unavailable"
+            else:
+                feature_status = "real"
+            row = {
+                "date": date,
+                "provider": provider,
+                "preprocessing_id": preprocessing,
+                "channel_index": index,
+                "channel": name,
+                "shape": list(values.shape),
+                "dtype": str(values.dtype),
+                "finite_fraction": float(finite.mean()),
+                "valid_pixel_fraction": float(valid.mean()),
+                "feature_status": feature_status,
+            }
+            if index == 16:
+                row["raw_n_clear_statistics"] = meta.get(f"{date_key}_quality_raw_stats")
+            if finite_values.size:
+                row.update({
+                    "min": float(finite_values.min()),
+                    "max": float(finite_values.max()),
+                    "mean": float(finite_values.mean()),
+                    "std": float(finite_values.std()),
+                })
+            else:
+                row.update({"min": None, "max": None, "mean": None, "std": None})
+            rows.append(row)
+    return rows
 
 
 def _validate_payload(body, engine="geonexus_ai"):
@@ -118,6 +185,16 @@ def _provider_error_kind(error):
     return "provider_unavailable"
 
 
+def _safe_provider_detail(error):
+    """Keep useful provider diagnostics while stripping paths, URLs and secret-like values."""
+    detail = str(error)
+    detail = re.sub(r"(?i)(bearer\s+)[^\s,;]+", r"\1[redacted]", detail)
+    detail = re.sub(r"(?i)(token|password|secret|credential|authorization)(\s*[=:]\s*)[^\s,;]+", r"\1\2[redacted]", detail)
+    detail = re.sub(r"(?i)https?://\S+", "[provider-url]", detail)
+    detail = re.sub(r"(?i)([a-z]:\\|/)(?:[^\s:]+[\\/])+[^\s:]*", "[path]", detail)
+    return detail[:240]
+
+
 def _validate_imagery(imagery, require_sar=False):
     import numpy as np
     t1, t2 = imagery.get("t1_tensor"), imagery.get("t2_tensor")
@@ -125,6 +202,65 @@ def _validate_imagery(imagery, require_sar=False):
         raise PipelineError("invalid_input_channels", "The imagery provider did not return usable multi-band arrays.")
     if t1.shape[0] != 17 or t2.shape[0] != 17 or t1.shape != t2.shape:
         raise PipelineError("invalid_input_channels", "Imagery must provide matching 17-channel T1/T2 arrays on the same grid.")
+    meta = imagery.get("meta") or {}
+    diagnostics = _input_channel_diagnostics(imagery)
+    app.logger.info("input_channel_diagnostics=%s", json.dumps(diagnostics, separators=(",", ":")))
+    if require_sar and (not meta.get("s1_used", False) or meta.get("sar_channels_available") is False):
+        provider = meta.get("provider", "unknown")
+        dates = f"T1 {meta.get('t1_date', 'unknown')}, T2 {meta.get('t2_date', 'unknown')}"
+        raise PipelineError(
+            "missing_sar_channels",
+            f"Geo-Nexus AI requires genuine Sentinel-1 VV, VH and VH_VV plus a valid Q feature. {provider} supplied unavailable or placeholder multimodal inputs for {dates}; use Spectral Index Analysis or configure a provider with real Sentinel-1 data.",
+            {"provider": provider, "dates": {"t1": meta.get("t1_date"), "t2": meta.get("t2_date")}, "channels": ["VV", "VH", "VH_VV", "Q"]},
+        )
+    if require_sar:
+        if meta.get("quality_channel_status") != "real" or "n_clear / 8" not in str(meta.get("quality_channel", "")):
+            raise PipelineError("missing_quality_channel", f"{meta.get('provider', 'The selected provider')} did not supply the trained multi-date Q = clip(n_clear / 8, 0, 1) feature for both dates.", {"provider": meta.get("provider", "unknown"), "channel": "Q", "dates": {"t1": meta.get("t1_date"), "t2": meta.get("t2_date")}})
+        if meta.get("pixel_resolution_m") != 10 or not str(meta.get("crs", "")).startswith("EPSG:326"):
+            raise PipelineError("invalid_input_grid", "Geo-Nexus AI requires both dates on the same 10 m UTM input grid.", {"provider": meta.get("provider", "unknown"), "crs": meta.get("crs"), "pixel_resolution_m": meta.get("pixel_resolution_m")})
+        for count_key in ("t1_scene_count", "t2_scene_count", "t1_s1_scene_count", "t2_s1_scene_count"):
+            if not isinstance(meta.get(count_key), (int, float)) or meta[count_key] <= 0:
+                date_key = "t1_date" if count_key.startswith("t1") else "t2_date"
+                raise PipelineError("imagery_unavailable", f"{meta.get('provider', 'The selected provider')} found no usable {count_key.replace('_scene_count', '').upper()} scenes for {meta.get(date_key, 'the selected date')}.", {"provider": meta.get("provider", "unknown"), "date": meta.get(date_key), "scene_count_field": count_key})
+    if require_sar:
+        provider = meta.get("provider", "unknown")
+        for label, image in (("T1", t1), ("T2", t2)):
+            quality = image[16]
+            date = meta.get(f"{label.lower()}_date", "unknown")
+            raw_quality_stats = meta.get(f"{label.lower()}_quality_raw_stats") or {}
+            finite_quality = quality[np.isfinite(quality)]
+            quality_std = float(finite_quality.std()) if finite_quality.size else None
+            details = {
+                "provider": provider, "date": date, "channel": "Q",
+                "preprocessing_id": meta.get("preprocessing_id", "unknown"),
+                "finite_fraction": float(np.isfinite(quality).mean()),
+                "positive_quality_fraction": float((quality > 0).mean()),
+                "min": float(finite_quality.min()) if finite_quality.size else None,
+                "max": float(finite_quality.max()) if finite_quality.size else None,
+                "std": quality_std, "raw_n_clear_std": raw_quality_stats.get("std"),
+                "raw_n_clear_valid_pixel_fraction": raw_quality_stats.get("valid_pixel_fraction"),
+                "expected_range": [0.0, 1.0], "minimum_raw_n_clear_std": QUALITY_STD_MIN,
+            }
+            if not np.isfinite(quality).all():
+                raise PipelineError("invalid_quality_channel", f"{label} Q input from {provider} on {date} contains NaN or infinite values; the trained Q channel must be finite and in [0, 1].", details)
+            if float(quality.min()) < 0 or float(quality.max()) > 1:
+                raise PipelineError("invalid_quality_channel", f"{label} Q input from {provider} on {date} is outside the trained [0, 1] range; check n_clear/8 encoding.", details)
+            if float(quality.max()) == 0:
+                raise PipelineError("invalid_quality_channel", f"{label} Q input from {provider} on {date} is all zero, indicating no valid clear observations or invalid masking.", details)
+            if float(np.mean(quality > 0)) < 0.05:
+                raise PipelineError("invalid_quality_channel", f"{label} Q input from {provider} on {date} has under 5% positive clear-observation coverage; check masking, nodata, and image availability.", details)
+            raw_valid_fraction = raw_quality_stats.get("valid_pixel_fraction")
+            if not isinstance(raw_valid_fraction, (int, float)) or not math.isfinite(raw_valid_fraction) or raw_valid_fraction < 1.0:
+                raise PipelineError("invalid_quality_channel", f"{label} raw n_clear from {provider} on {date} contains non-finite or missing pixels before Q encoding.", details)
+            raw_min = raw_quality_stats.get("min")
+            raw_max = raw_quality_stats.get("max")
+            if not isinstance(raw_min, (int, float)) or not isinstance(raw_max, (int, float)) or raw_min < 0 or raw_max > meta.get(f"{label.lower()}_scene_count", 0):
+                raise PipelineError("invalid_quality_channel", f"{label} raw n_clear from {provider} on {date} is inconsistent with the acquired Sentinel-2 scene count.", details)
+            raw_n_clear_std = raw_quality_stats.get("std")
+            if not isinstance(raw_n_clear_std, (int, float)) or not math.isfinite(raw_n_clear_std):
+                raise PipelineError("invalid_quality_channel", f"{label} Q input from {provider} on {date} is missing the raw n_clear diagnostic required by the trained preprocessing contract.", details)
+            if raw_n_clear_std <= QUALITY_STD_MIN:
+                raise PipelineError("invalid_quality_channel", f"{label} raw n_clear from {provider} on {date} does not meet the trained composite heterogeneity check (std(n_clear) must exceed {QUALITY_STD_MIN:.1f} observations). The model input Q is n_clear/8 clipped to [0,1]; check the selected date window and cloud-score matching.", details)
     if min(t1.shape[1:]) < 128:
         raise PipelineError("area_too_small", "The AI model needs at least 128×128 pixels at 10 m. Choose an area at least about 1.3 km in each dimension.")
     if not np.isfinite(t1).all() or not np.isfinite(t2).all():
@@ -133,15 +269,17 @@ def _validate_imagery(imagery, require_sar=False):
         optical_coverage = np.mean(image[:11] > 0, axis=(1, 2))
         if np.any(optical_coverage < 0.05):
             raise PipelineError("invalid_input_channels", f"{label} imagery is missing one or more Sentinel-2 optical bands required for analysis.")
+        if np.any((image[:11] < 0) | (image[:11] > 32767)):
+            raise PipelineError("invalid_input_channels", f"{label} Sentinel-2 bands are outside the trained reflectance-DN storage range.", {"provider": meta.get("provider", "unknown"), "date": meta.get(f"{label.lower()}_date"), "channels": INPUT_CHANNEL_ORDER[:11]})
+        if require_sar and np.any(np.abs(image[11:13]) > 1.0001):
+            raise PipelineError("invalid_input_channels", f"{label} NDVI/NDBI are outside their trained floating-point [-1, 1] range.", {"provider": meta.get("provider", "unknown"), "date": meta.get(f"{label.lower()}_date"), "channels": ["NDVI", "NDBI"]})
         if require_sar and np.any(np.mean(image[13:16] != 0, axis=(1, 2)) < 0.05):
             raise PipelineError("missing_sar_channels", f"{label} imagery is missing one or more real Sentinel-1 channels required by the model.")
-        if require_sar and float(np.ptp(image[16])) <= 0:
-            raise PipelineError("invalid_quality_channel", f"{label} imagery has no spatial variation in the trained clear-observation quality channel.")
+        if require_sar and np.any((image[13:16] < -5000) | (image[13:16] > 1000)):
+            raise PipelineError("invalid_input_channels", f"{label} Sentinel-1 dB × 100 channels are outside the trained storage range.", {"provider": meta.get("provider", "unknown"), "date": meta.get(f"{label.lower()}_date"), "channels": INPUT_CHANNEL_ORDER[13:16]})
     valid = (t1[2] > 100) & (t1[6] > 100) & (t2[2] > 100) & (t2[6] > 100)
     if float(valid.mean()) < 0.05:
         raise PipelineError("nodata", "Imagery contains too little valid optical coverage for analysis. Choose a smaller or clearer region/date window.")
-    if require_sar and not (imagery.get("meta") or {}).get("s1_used", False):
-        raise PipelineError("missing_sar_channels", "Geo-Nexus AI requires real Sentinel-1 VV, VH, VH_VV and spatial quality inputs. The selected provider supplied Sentinel-2 only; run Spectral Index Analysis or configure working Google Earth Engine access.")
 
 
 def _update_job(job_id: str, **kwargs):
@@ -210,9 +348,14 @@ def _run_job(job_id: str, payload: dict):
                 if "single-request 10 m model grid limit" in str(gee_err):
                     raise PipelineError("area_too_large", "This area is too large for one 10 m AI request. Draw a smaller bbox and retry.") from gee_err
                 gee_failure = gee_err
-                provider_attempts.append({"provider": "Google Earth Engine", "status": _provider_error_kind(gee_err)})
-                app.logger.warning(f"[{job_id}] GEE unavailable; falling back to Sentinel-2 Open Data.")
+                attempt = {"provider": "Google Earth Engine", "status": _provider_error_kind(gee_err), "error_type": type(gee_err).__name__, "detail": _safe_provider_detail(gee_err)}
+                provider_attempts.append(attempt)
+                app.logger.warning("provider_attempt=%s", json.dumps({"job_id": job_id, **attempt}, separators=(",", ":")))
                 _update_job(job_id, progress="🛰 GEE permission error — falling back to Sentinel-2 Open Data…")
+        else:
+            attempt = {"provider": "Google Earth Engine", "status": "not_configured", "detail": "GEE_PROJECT_ID is not configured; Sentinel-2 STAC will be tried."}
+            provider_attempts.append(attempt)
+            app.logger.info("provider_attempt=%s", json.dumps({"job_id": job_id, **attempt}, separators=(",", ":")))
 
         # Strategy 2: High-speed Sentinel-2 STAC (free, no auth, no billing required)
         if imagery is None:
@@ -232,7 +375,9 @@ def _run_job(job_id: str, payload: dict):
                 provider_attempts.append({"provider": provider, "status": "success"})
             except Exception as stac_err:
                 app.logger.exception("[%s] Sentinel-2 STAC acquisition failed", job_id)
-                provider_attempts.append({"provider": "Sentinel-2 STAC", "status": _provider_error_kind(stac_err)})
+                attempt = {"provider": "Sentinel-2 STAC", "status": _provider_error_kind(stac_err), "error_type": type(stac_err).__name__, "detail": _safe_provider_detail(stac_err)}
+                provider_attempts.append(attempt)
+                app.logger.warning("provider_attempt=%s", json.dumps({"job_id": job_id, **attempt}, separators=(",", ":")))
                 if gee_failure:
                     if _provider_error_kind(gee_failure) == "authentication_failed":
                         raise PipelineError("authentication_failed", "Google Earth Engine authentication failed, and Sentinel-2 STAC could not provide imagery for both dates.") from stac_err
@@ -244,7 +389,7 @@ def _run_job(job_id: str, payload: dict):
         meta["provider_fallback"] = bool(gee_failure and provider == "Sentinel-2 STAC")
         meta["provider_attempts"] = provider_attempts
         meta["input_channels"] = 17
-        meta["input_channel_order"] = ["B2", "B3", "B4", "B5", "B6", "B7", "B8", "B8A", "B9", "B11", "B12", "NDVI", "NDBI", "VV", "VH", "VH_VV", "Q"]
+        meta["input_channel_order"] = INPUT_CHANNEL_ORDER
         meta["ai_input_contract"] = "complete" if meta.get("s1_used", False) else "incomplete"
         _validate_imagery(imagery, require_sar=True)
 
@@ -318,8 +463,10 @@ def _run_job(job_id: str, payload: dict):
         app.logger.error(f"[{job_id}] ERROR: {e}\n{tb}")
         code = e.code if isinstance(e, PipelineError) else "pipeline_failed"
         message = str(e) if isinstance(e, PipelineError) else "Geo-Nexus AI analysis failed. Check imagery availability and server logs, then retry."
-        failure_meta = {key: meta[key] for key in ("provider", "provider_fallback", "input_channels", "s1_used") if "meta" in locals() and key in meta}
+        failure_meta = {key: meta[key] for key in ("provider", "provider_fallback", "input_channels", "s1_used", "preprocessing_id", "t1_date", "t2_date", "quality_channel", "quality_channel_status") if "meta" in locals() and key in meta}
         failure_meta["provider_attempts"] = locals().get("provider_attempts", [])
+        if isinstance(e, PipelineError):
+            failure_meta["diagnostic"] = e.details
         _update_job(job_id, status="error", progress="❌ Failed", error=message, error_code=code, meta=failure_meta)
 
 

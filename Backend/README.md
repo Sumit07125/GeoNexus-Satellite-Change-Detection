@@ -4,7 +4,9 @@ Flask-based asynchronous API server providing dual-engine satellite change detec
 1. **Primary — Geo-Nexus AI Model** (`MH-DAPT-CD v3.2`, Siamese ResNet encoder, trained on Sentinel-1 + Sentinel-2 inputs).
 2. **Explicit alternative — Spectral Index Analysis (S-CVA)** (optical NDVI, NDWI, NDBI, BSI and change-vector analysis; it does not run the neural model).
 
-The AI endpoint requires real Sentinel-1 VV/VH/VH_VV and spatial quality channels. Google Earth Engine constructs these inputs on the documented 10 m UTM grid. The runtime accepts areas at least 128×128 pixels (about 1.3 km per side) and caps a single download at 400,000 pixels. The public STAC provider currently supplies Sentinel-2 only, so AI inference stops with a structured `missing_sar_channels` error after STAC fallback; it never runs the model with synthetic SAR values. STAC remains available to the spectral endpoint.
+The AI endpoint requires genuine Sentinel-1 VV/VH/VH_VV and the trained Q quality feature. Google Earth Engine constructs these inputs on the documented 10 m UTM grid. The runtime accepts areas at least 128×128 pixels (about 1.3 km per side) and caps a single download at 400,000 pixels. The public STAC provider supplies Sentinel-2 only; if GEE acquisition fails, the AI request stops with a structured `missing_sar_channels` error that identifies the actual provider and dates. STAC's constant SAR/Q placeholders are never passed to the model. STAC remains available to the spectral endpoint.
+
+For the production multi-date composite path, training defines `Q = clip(n_clear / 8, 0, 1)`, where `n_clear` counts B4 observations after linked Cloud Score+ `cs_cdf >= 0.60` masking. The training heterogeneity gate applies to raw `n_clear` (`std(n_clear) > 0.5`) before Q clipping, so a constant Q raster can be valid when the raw count varied above the clipping ceiling. GEE records raw count statistics; runtime checks source provenance, finite values, encoded range and all-zero/low-coverage nodata before applying the criterion to raw counts. Missing raw diagnostics or failed heterogeneity returns provider/date/channel details; no variation is fabricated. The single-date monsoon benchmark uses `cs_cdf` directly, but the runtime does not currently acquire that product.
 
 ## Architecture
 
@@ -16,6 +18,7 @@ The AI endpoint requires real Sentinel-1 VV/VH/VH_VV and spatial quality channel
 - **`storage_manager.py`**: Thread-safe SQLite persistence for predicted outcomes.
 - **`Model/`**: Model architecture (`p3_geonexus_model.py`), manifest, normalization stats, and weights.
 - **`tests/`**: Integration and validation test suites.
+- **`diagnostics/region_pair_diagnostic.py`**: Optional local admin-only 30-candidate operational diagnostic using GEE, the production checkpoint, reproducible candidates, separate S-CVA output, and honest failure records. It does not generate research accuracy metrics.
 
 ## Setup Instructions
 
@@ -82,4 +85,6 @@ python -m unittest discover -s tests -p test_reliability_contracts.py -v
 ```
 
 The older `test_verify_*.py` and overlay scripts are scratch-data diagnostics. They require `scratch_t1.png`, `scratch_t2.png`, and/or `scratch_tensors.npz` in `Backend/`; those fixtures are not committed. `test_gee_full_pipeline.py` queries the live public STAC service and needs network access.
+
+The deterministic suite tests Q range/nodata/heterogeneity cases and provider separation with local arrays and mocked services. It does not validate live GEE credentials or current imagery availability. See [diagnostics/README.md](diagnostics/README.md) for the optional operational diagnostic and its access/configuration requirements.
 

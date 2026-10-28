@@ -226,13 +226,14 @@ export default function App() {
   }, [cachedMatch, setBbox]);
 
   // ── Analyze handler — with automatic cache retrieval ─────────
-  const handleAnalyze = useCallback(async () => {
+  const handleAnalyze = useCallback(async (options = {}) => {
+    const bypassCache = options?.bypassCache === true;
     if (!bbox) { setError('Please select or enter coordinates for an area on the map.'); return; }
     if (!dateT1 || !dateT2) { setError('Please select both T1 and T2 dates.'); return; }
     if (dateT1 >= dateT2) { setError('T1 (Before) date must be earlier than T2 (After) date.'); return; }
 
     // If an identical prediction was already generated and saved, load instantly!
-    if (cachedMatch) {
+    if (cachedMatch && !bypassCache) {
       handleLoadCachedPrediction(cachedMatch);
       return;
     }
@@ -328,12 +329,13 @@ export default function App() {
   }, [bbox, locationName, dateT1, dateT2, windowDays, maxCloud, cachedMatch, handleLoadCachedPrediction]);
 
   // ── Enhanced Spectral Analysis handler (no ML model — pure spectral indices) ──
-  const handleSpectralAnalyze = useCallback(async () => {
+  const handleSpectralAnalyze = useCallback(async (options = {}) => {
+    const bypassCache = options?.bypassCache === true;
     if (!bbox) { setError('Please select or enter coordinates for an area on the map.'); return; }
     if (!dateT1 || !dateT2) { setError('Please select both T1 and T2 dates.'); return; }
     if (dateT1 >= dateT2) { setError('T1 (Before) date must be earlier than T2 (After) date.'); return; }
 
-    if (cachedSpectralMatch) {
+    if (cachedSpectralMatch && !bypassCache) {
       handleLoadCachedPrediction(cachedSpectralMatch);
       return;
     }
@@ -852,15 +854,15 @@ export default function App() {
                   <button
                     className="btn btn-primary"
                     style={{ flex: 1, fontSize: '0.8rem', padding: '0.4rem 0.8rem' }}
-                    onClick={handleAnalyze}
+                    onClick={() => handleAnalyze({ bypassCache: true })}
                     disabled={!bbox || !dateT1 || !dateT2}
                   >
-                    🔄 Try Again
+                    🔄 Retry AI
                   </button>
                   <button
                     className="btn btn-spectral"
                     style={{ fontSize: '0.8rem', padding: '0.4rem 0.8rem' }}
-                    onClick={handleSpectralAnalyze}
+                    onClick={() => handleSpectralAnalyze({ bypassCache: true })}
                     disabled={!bbox || !dateT1 || !dateT2 || loading}
                   >
                     Run Spectral Analysis
@@ -1047,8 +1049,8 @@ export default function App() {
                 <div className="error-box" role="alert" style={{ marginBottom: '1rem', justifyContent: 'space-between', flexWrap: 'wrap' }}>
                   <span><span className="error-icon">⚠</span> {error}</span>
                   <span style={{ display: 'flex', gap: '.5rem', flexWrap: 'wrap' }}>
-                    <button className="btn btn-primary" onClick={handleAnalyze} disabled={loading || !bbox}>Retry AI</button>
-                    <button className="btn btn-spectral" onClick={handleSpectralAnalyze} disabled={loading || !bbox}>Run Spectral Analysis</button>
+                    <button className="btn btn-primary" onClick={() => handleAnalyze({ bypassCache: true })} disabled={loading || !bbox}>Retry AI</button>
+                    <button className="btn btn-spectral" onClick={() => handleSpectralAnalyze({ bypassCache: true })} disabled={loading || !bbox}>Run Spectral Analysis</button>
                     <button className="btn btn-ghost" onClick={() => setError(null)}>Dismiss</button>
                   </span>
                 </div>

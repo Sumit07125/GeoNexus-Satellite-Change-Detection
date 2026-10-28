@@ -17,7 +17,7 @@ export const ANALYSIS_METHODS = Object.freeze({
 
 export function getEngineLabel(result) {
   const engine = result?.engine;
-  return result?.engine_label || ANALYSIS_METHODS[engine]?.label || 'Analysis source unknown';
+  return result?.engine_label || ANALYSIS_METHODS[engine]?.label || 'Source unknown';
 }
 
 export function findPredictionForEngine(items, bbox, dateT1, dateT2, engine, tolerance = 0.008) {
