@@ -43,7 +43,7 @@ Ensure `VITE_API_URL` points to your running Flask backend:
 VITE_API_URL=http://localhost:5000
 ```
 
-AI inference requires a working Google Earth Engine connection for real Sentinel-1 inputs. If the backend falls back to Sentinel-2-only STAC imagery, AI analysis reports that the model input is incomplete. The explicitly selected spectral method can use that STAC imagery and is always labeled as spectral analysis.
+AI inference requires a configured and authenticated Google Earth Engine project for real Sentinel-1 inputs. The backend reports configuration, authentication, access, acquisition, and input-validation failures without falling back to Sentinel-2-only STAC. The explicitly selected spectral method can use STAC imagery and is always labeled as spectral analysis. Backend health distinguishes API availability from AI provider readiness; remote Earth Engine access and strict checkpoint loading are confirmed during a run.
 
 ### 4. Development Server
 

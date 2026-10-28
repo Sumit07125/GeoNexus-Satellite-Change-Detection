@@ -145,6 +145,7 @@ def _json_safe(value):
 
 
 def run_diagnostic(config_path: Path, output_dir: Path, count: int = 30, seed: int = 314159, run_spectral: bool = False) -> dict:
+    from gee_config import get_gee_configuration
     config = json.loads(config_path.read_text(encoding="utf-8"))
     allowed_hash = str(config.get("admin_token_sha256", "")).strip().lower()
     supplied_token = os.environ.get("GEONEXUS_DIAGNOSTIC_ADMIN_TOKEN", "")
@@ -156,11 +157,14 @@ def run_diagnostic(config_path: Path, output_dir: Path, count: int = 30, seed: i
 
     candidates = _load_candidates(config, count, seed)
     output_dir.mkdir(parents=True, exist_ok=True)
-    if not os.environ.get("GEE_PROJECT_ID", "").strip():
+    gee_configuration = get_gee_configuration()
+    if not gee_configuration.get("configured"):
         provider_available = False
-        provider_message = "GEE_PROJECT_ID is not configured; this AI diagnostic requires real Sentinel-1 and Q inputs from Google Earth Engine."
+        provider_code = gee_configuration["code"]
+        provider_message = gee_configuration["message"]
     else:
         provider_available = True
+        provider_code = None
         provider_message = None
 
     report = {
@@ -176,7 +180,7 @@ def run_diagnostic(config_path: Path, output_dir: Path, count: int = 30, seed: i
     }
     if not provider_available:
         for candidate in candidates:
-            report["runs"].append({**candidate, "status": "acquisition_failed", "error_code": "provider_unavailable", "error": provider_message, "engine": "geonexus_ai"})
+            report["runs"].append({**candidate, "status": "acquisition_failed", "error_code": provider_code, "error": provider_message, "engine": "geonexus_ai"})
         report["summary"] = {"candidate_count": len(candidates), "ai_success": 0, "ai_failed": len(candidates), "spectral_success": 0, "spectral_failed": 0, "accuracy_metrics": None}
         (output_dir / "diagnostic_report.json").write_text(json.dumps(report, indent=2), encoding="utf-8")
         return report

@@ -20,82 +20,40 @@ except Exception:
 _EE_INITIALIZED = False
 
 
+class GEEProviderError(Exception):
+    def __init__(self, code: str, message: str):
+        super().__init__(message)
+        self.code = code
+        self.message = message
+
+
 def init_ee():
-    """
-    Initialize Earth Engine once per process.
-    Tries multiple strategies in order:
-      1. Service account key (if GEE_SERVICE_ACCOUNT_KEY is set)
-      2. User credentials + specified GEE_PROJECT_ID
-      3. User credentials without project (legacy EE accounts)
-    """
+    """Initialize EE from one explicitly configured authentication method."""
     global _EE_INITIALIZED
     if _EE_INITIALIZED:
         return
+    from gee_config import ensure_gee_configuration, classify_gee_error
 
-    project = os.environ.get("GEE_PROJECT_ID", "").strip()
-    key_path = os.environ.get("GEE_SERVICE_ACCOUNT_KEY", "").strip()
-
-    print(f"[GEE] init_ee() called — project='{project}' key='{key_path or 'none'}'")
-
-    last_error = None
-
-    # Strategy 1: Service account JSON key
-    if key_path and os.path.isfile(key_path):
-        try:
+    config = ensure_gee_configuration()
+    project = os.environ["GEE_PROJECT_ID"].strip()
+    try:
+        if config.get("auth_method") == "service_account":
+            key_path = os.environ["GEE_SERVICE_ACCOUNT_KEY"].strip()
             credentials = ee.ServiceAccountCredentials(email=None, key_file=key_path)
-            ee.Initialize(credentials=credentials, project=project or None)
-            _EE_INITIALIZED = True
-            print(f"[GEE] Initialized via service account. Project: {project or 'default'}")
-            return
-        except Exception as e:
-            last_error = e
-            print(f"[GEE] Service account init failed: {e}")
-
-    # Strategy 2: User credentials + project ID
-    if project:
-        try:
+            ee.Initialize(credentials=credentials, project=project)
+        else:
             ee.Initialize(project=project)
-            _EE_INITIALIZED = True
-            print(f"[GEE] Initialized with project: {project}")
-            return
-        except Exception as e:
-            last_error = e
-            print(f"[GEE] Project-based init failed: {e}")
-
-    # Strategy 3: Legacy user credentials (reads project from credentials file)
-    try:
-        print("[GEE] Trying legacy initialization (no project arg)...")
-        ee.Initialize()
         _EE_INITIALIZED = True
-        print("[GEE] Initialized in legacy mode.")
-        return
-    except Exception as e:
-        last_error = e
-        print(f"[GEE] Legacy init also failed: {e}")
-
-    # Strategy 4: High-volume endpoint (sometimes bypasses permission issues)
-    try:
-        print("[GEE] Trying high-volume endpoint...")
-        ee.Initialize(
-            project=project,
-            opt_url='https://earthengine-highvolume.googleapis.com'
-        )
-        _EE_INITIALIZED = True
-        print("[GEE] Initialized via high-volume endpoint.")
-        return
-    except Exception as e:
-        last_error = e
-        print(f"[GEE] High-volume init also failed: {e}")
-
-    raise RuntimeError(
-        f"All Google Earth Engine initialization strategies failed.\n"
-        f"Last error: {last_error}\n\n"
-        f"To fix:\n"
-        f"  1. Run: earthengine authenticate\n"
-        f"  2. Enable EE API: https://console.cloud.google.com/apis/library/earthengine.googleapis.com?project={project}\n"
-        f"  3. Grant IAM role: https://console.cloud.google.com/iam-admin/iam?project={project}\n"
-        f"     Add your Google account → Role: 'Earth Engine Resource User'"
-    )
+    except Exception as error:
+        if config.get("auth_method") == "service_account":
+            message = str(error).lower()
+            if any(term in message for term in ("private key", "pem", "malformed", "service account", "serviceaccount")):
+                raise GEEProviderError(
+                    "gee_service_account_invalid",
+                    "The configured Earth Engine service-account key could not be loaded. Check that it is a valid, unexpired service-account JSON key.",
+                ) from error
+        code, message = classify_gee_error(error)
+        raise GEEProviderError(code, message) from error
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -105,6 +63,25 @@ def init_ee():
 S2_BANDS = ["B2", "B3", "B4", "B5", "B6", "B7", "B8", "B8A", "B9", "B11", "B12"]
 # Channel order: 11 optical raw + NDVI + NDBI + VV + VH + VH_VV + Q
 CHANNEL_ORDER = [*S2_BANDS, "NDVI", "NDBI", "VV", "VH", "VH_VV", "Q"]
+
+
+def _scene_metadata(collection):
+    """Return bounded, non-sensitive scene IDs and UTC acquisition timestamps."""
+    rows = collection.reduceColumns(
+        ee.Reducer.toList(2), ["system:index", "system:time_start"]
+    ).get("list").getInfo() or []
+    scenes = []
+    for row in rows:
+        if not isinstance(row, (list, tuple)) or len(row) != 2:
+            continue
+        timestamp = row[1]
+        scenes.append({
+            "scene_id": str(row[0]),
+            "acquisition_datetime": datetime.datetime.fromtimestamp(
+                int(timestamp) / 1000, tz=datetime.timezone.utc
+            ).isoformat().replace("+00:00", "Z") if timestamp is not None else None,
+        })
+    return scenes
 
 
 def _get_s2_composite(bbox: ee.Geometry, date_str: str, window_days: int, max_cloud: int):
@@ -141,7 +118,9 @@ def _get_s2_composite(bbox: ee.Geometry, date_str: str, window_days: int, max_cl
     ndvi = b8.subtract(b4).divide(b8.add(b4).add(eps)).rename("NDVI")
     ndbi = b11.subtract(b8).divide(b11.add(b8).add(eps)).rename("NDBI")
 
-    return composite.addBands([ndvi, ndbi, n_clear]), int(col.size().getInfo())
+    scene_count = int(col.size().getInfo())
+    scenes = _scene_metadata(col) if scene_count else []
+    return composite.addBands([ndvi, ndbi, n_clear]), scene_count, scenes
 
 
 def _get_s1_composite(bbox: ee.Geometry, date_str: str, window_days: int, relative_orbit: int):
@@ -180,7 +159,8 @@ def _get_s1_composite(bbox: ee.Geometry, date_str: str, window_days: int, relati
     vh = composite.select("VH")
     vhvv = vh.subtract(vv).rename("VH_VV")
 
-    return composite.addBands(vhvv), scene_count
+    scenes = _scene_metadata(col)
+    return composite.addBands(vhvv), scene_count, scenes
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -224,16 +204,16 @@ def fetch_imagery(
     thumb_dim = f"{out_w}x{out_h}"
 
     # ── T1 composite ────────────────────────────────────────────────────────
-    s2_t1, t1_count = _get_s2_composite(bbox, date_t1, window_days, max_cloud)
+    s2_t1, t1_count, t1_s2_scenes = _get_s2_composite(bbox, date_t1, window_days, max_cloud)
     if t1_count == 0:
         raise RuntimeError(f"No Sentinel-2 scenes matched the T1 window for {date_t1}.")
-    s1_t1, t1_s1_count = _get_s1_composite(bbox, date_t1, window_days, relative_orbit)
+    s1_t1, t1_s1_count, t1_s1_scenes = _get_s1_composite(bbox, date_t1, window_days, relative_orbit)
 
     # ── T2 composite ────────────────────────────────────────────────────────
-    s2_t2, t2_count = _get_s2_composite(bbox, date_t2, window_days, max_cloud)
+    s2_t2, t2_count, t2_s2_scenes = _get_s2_composite(bbox, date_t2, window_days, max_cloud)
     if t2_count == 0:
         raise RuntimeError(f"No Sentinel-2 scenes matched the T2 window for {date_t2}.")
-    s1_t2, t2_s1_count = _get_s1_composite(bbox, date_t2, window_days, relative_orbit)
+    s1_t2, t2_s1_count, t2_s1_scenes = _get_s1_composite(bbox, date_t2, window_days, relative_orbit)
 
     # ── RGB thumbnails (B4=Red, B3=Green, B2=Blue) ──────────────────────────
     vis_rgb = {"bands": ["B4", "B3", "B2"], "min": 0, "max": 3000, "gamma": 1.4}
@@ -286,6 +266,15 @@ def fetch_imagery(
         "t2_scene_count": t2_count,
         "t1_s1_scene_count": t1_s1_count,
         "t2_s1_scene_count": t2_s1_count,
+        "t1_s2_scenes": t1_s2_scenes,
+        "t2_s2_scenes": t2_s2_scenes,
+        "t1_s1_scenes": t1_s1_scenes,
+        "t2_s1_scenes": t2_s1_scenes,
+        "t1_acquisition_datetimes": [scene["acquisition_datetime"] for scene in t1_s2_scenes],
+        "t2_acquisition_datetimes": [scene["acquisition_datetime"] for scene in t2_s2_scenes],
+        "t1_s1_acquisition_datetimes": [scene["acquisition_datetime"] for scene in t1_s1_scenes],
+        "t2_s1_acquisition_datetimes": [scene["acquisition_datetime"] for scene in t2_s1_scenes],
+        "provider_attempts": [{"provider": "Google Earth Engine", "status": "success"}],
         "window_days": window_days,
         "max_cloud_pct": max_cloud,
         "clear_score_threshold": 0.60,

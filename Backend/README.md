@@ -4,7 +4,7 @@ Flask-based asynchronous API server providing dual-engine satellite change detec
 1. **Primary — Geo-Nexus AI Model** (`MH-DAPT-CD v3.2`, Siamese ResNet encoder, trained on Sentinel-1 + Sentinel-2 inputs).
 2. **Explicit alternative — Spectral Index Analysis (S-CVA)** (optical NDVI, NDWI, NDBI, BSI and change-vector analysis; it does not run the neural model).
 
-The AI endpoint requires genuine Sentinel-1 VV/VH/VH_VV and the trained Q quality feature. Google Earth Engine constructs these inputs on the documented 10 m UTM grid. The runtime accepts areas at least 128×128 pixels (about 1.3 km per side) and caps a single download at 400,000 pixels. The public STAC provider supplies Sentinel-2 only; if GEE acquisition fails, the AI request stops with a structured `missing_sar_channels` error that identifies the actual provider and dates. STAC's constant SAR/Q placeholders are never passed to the model. STAC remains available to the spectral endpoint.
+The AI endpoint requires genuine Sentinel-1 VV/VH/VH_VV and the trained Q quality feature. Google Earth Engine constructs these inputs on the documented 10 m UTM grid. The runtime accepts areas at least 128×128 pixels (about 1.3 km per side) and caps a single download at 400,000 pixels. The public STAC provider supplies Sentinel-2 only and is used by the explicit spectral endpoint. The AI endpoint never falls back to STAC: it returns a structured readiness, authentication, project-access, acquisition, or input-validation error when GEE cannot provide the trained multimodal inputs. STAC's constant SAR/Q placeholders are never passed to the model.
 
 For the production multi-date composite path, training defines `Q = clip(n_clear / 8, 0, 1)`, where `n_clear` counts B4 observations after linked Cloud Score+ `cs_cdf >= 0.60` masking. The training heterogeneity gate applies to raw `n_clear` (`std(n_clear) > 0.5`) before Q clipping, so a constant Q raster can be valid when the raw count varied above the clipping ceiling. GEE records raw count statistics; runtime checks source provenance, finite values, encoded range and all-zero/low-coverage nodata before applying the criterion to raw counts. Missing raw diagnostics or failed heterogeneity returns provider/date/channel details; no variation is fabricated. The single-date monsoon benchmark uses `cs_cdf` directly, but the runtime does not currently acquire that product.
 
@@ -48,7 +48,8 @@ cp .env.example .env
 ```
 
 Edit `.env` to configure your settings:
-- `GEE_PROJECT_ID`: (Optional) Your Google Cloud project with Earth Engine API enabled. If not set, the server automatically defaults to the free Sentinel-2 STAC open data fetcher.
+- `GEE_PROJECT_ID`: Required for AI. Replace `your-gcp-project-id` with a real Google Cloud project that has the Earth Engine API enabled. Missing, blank, and placeholder values are rejected; spectral analysis remains usable.
+- Authentication: run `earthengine authenticate` for local user credentials, or set `GEE_SERVICE_ACCOUNT_KEY` to a valid service-account JSON file whose account has Earth Engine access to the configured project. Secret contents are never returned by health checks.
 - `FRONTEND_URL`: `http://localhost:5173`
 - `FLASK_PORT`: `5000`
 - `CORS_ORIGINS`: comma-separated browser origins; defaults to `FRONTEND_URL`.
@@ -66,7 +67,7 @@ Health check endpoint: `GET /api/health`
 
 | Method | Endpoint | Description |
 |---|---|---|
-| `GET` | `/api/health` | Service health status and environment check |
+| `GET` | `/api/health` | API status, checkpoint file presence, and sanitized AI/GEE readiness (remote access is verified during a run) |
 | `POST` | `/api/detect/start` | Submit an AI change detection job |
 | `POST` | `/api/detect/spectral/start` | Submit an enhanced multi-spectral change detection job |
 | `GET` | `/api/detect/status/<job_id>` | Poll job progress and retrieve result or structured error |
@@ -74,11 +75,11 @@ Health check endpoint: `GET /api/health`
 | `POST` | `/api/predictions` | Save/update a prediction record |
 | `DELETE` | `/api/predictions/<id>` | Delete a saved prediction record |
 
-Both start endpoints validate bbox coordinates, ordered ISO dates, cloud percentage, temporal search window, and engine-specific thresholds. Successful responses include an engine ID, display label, algorithm/model version, threshold provenance, and imagery provider/acquisition metadata. Legacy database rows are retained with source `unknown`; cache matching is engine-specific.
+Both start endpoints validate bbox coordinates, ordered ISO dates, cloud percentage, temporal search window, and engine-specific thresholds. The AI start endpoint checks project and credential configuration before queueing; authentication, project access, imagery availability, input validity, and strict model loading are checked during the job. GEE-to-STAC fallback is not used for AI. Successful responses include an engine ID, display label, algorithm/model version, threshold provenance, and imagery provider/acquisition metadata. Legacy database rows are retained with source `unknown`; cache matching is engine-specific.
 
 ## Running Tests
 
-The deterministic API, model-input, provider-fallback, and storage-migration checks are located in `tests/`:
+The deterministic API, model-input, provider separation, and storage-migration checks are located in `tests/`:
 
 ```bash
 python -m unittest discover -s tests -p test_reliability_contracts.py -v

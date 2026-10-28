@@ -17,6 +17,9 @@ from PIL import Image
 import app as api
 import storage_manager
 import inference
+import gee_config
+import gee_service
+import sentinel_stac_service as stac_service
 from gee_service import _encode_model_tensor
 from diagnostics.region_pair_diagnostic import generate_candidates, run_diagnostic
 
@@ -31,6 +34,58 @@ class ReliabilityContractTests(unittest.TestCase):
         response = self.client.get("/api/health")
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json["engines"], ["geonexus_ai", "spectral_scva"])
+        self.assertIn("ai_readiness", response.json)
+        self.assertFalse(response.json["ai_readiness"]["ready"])
+
+    def test_gee_configuration_rejects_missing_and_case_insensitive_placeholders(self):
+        for project in (None, "", "  YOUR-GCP-PROJECT-ID  ", "Not Set", "your_gee_project_id"):
+            with self.subTest(project=project), patch.dict(os.environ, {} if project is None else {"GEE_PROJECT_ID": project}, clear=project is None):
+                state = gee_config.get_gee_configuration()
+                self.assertEqual(state["code"], "gee_not_configured")
+                self.assertFalse(state["configured"])
+
+    def test_gee_configuration_requires_user_credentials_or_valid_service_account(self):
+        with patch.dict(os.environ, {"GEE_PROJECT_ID": "real-project", "GEE_SERVICE_ACCOUNT_KEY": ""}), patch.object(gee_config, "_local_credential_file", return_value=None):
+            self.assertEqual(gee_config.get_gee_configuration()["code"], "gee_credentials_missing")
+        with tempfile.TemporaryDirectory() as temp_dir:
+            invalid_key = Path(temp_dir) / "service.json"
+            invalid_key.write_text('{"type":"user_credentials"}', encoding="utf-8")
+            with patch.dict(os.environ, {"GEE_PROJECT_ID": "real-project", "GEE_SERVICE_ACCOUNT_KEY": str(invalid_key)}):
+                self.assertEqual(gee_config.get_gee_configuration()["code"], "gee_service_account_invalid")
+
+    def test_gee_authentication_and_project_access_errors_have_safe_categories(self):
+        self.assertEqual(gee_config.classify_gee_error(RuntimeError("invalid_grant oauth token"))[0], "gee_authentication_failed")
+        self.assertEqual(gee_config.classify_gee_error(RuntimeError("403 project permission denied"))[0], "gee_project_access_denied")
+        self.assertEqual(gee_config.classify_gee_error(RuntimeError("No Sentinel-1 scenes"))[0], "gee_imagery_unavailable")
+
+    def test_gee_init_uses_configured_credentials_and_classifies_auth_failure(self):
+        config = {"configured": True, "auth_method": "local_credentials"}
+        with patch.dict(os.environ, {"GEE_PROJECT_ID": "test-project"}), \
+             patch("gee_config.ensure_gee_configuration", return_value=config), \
+             patch.object(gee_service.ee, "Initialize", side_effect=RuntimeError("invalid_grant")), \
+             patch.object(gee_service, "_EE_INITIALIZED", False):
+            with self.assertRaises(gee_service.GEEProviderError) as caught:
+                gee_service.init_ee()
+        self.assertEqual(caught.exception.code, "gee_authentication_failed")
+        self.assertNotIn("invalid_grant", str(caught.exception))
+
+    def test_ai_preflight_fails_before_queue_but_spectral_route_stays_available(self):
+        no_gee = {"status": "credentials_missing", "code": "gee_credentials_missing", "configured": False, "message": "Configure Earth Engine credentials."}
+        with patch("app.get_gee_configuration", return_value=no_gee), patch("app.threading.Thread") as thread:
+            ai = self.client.post("/api/detect/start", json=self.payload)
+            spectral = self.client.post("/api/detect/spectral/start", json=self.payload)
+        self.assertEqual(ai.status_code, 503)
+        self.assertEqual(ai.json["error_code"], "gee_credentials_missing")
+        self.assertEqual(ai.json["meta"]["requested_dates"], {"t1": "2021-01-01", "t2": "2022-01-01"})
+        thread.assert_called_once()
+        self.assertEqual(spectral.status_code, 200)
+
+    def test_health_does_not_call_checkpoint_file_presence_ai_ready(self):
+        ready = {"status": "configured", "code": None, "configured": True}
+        with patch("app.get_gee_configuration", return_value=ready):
+            response = self.client.get("/api/health")
+        self.assertFalse(response.json["ai_readiness"]["ready"])
+        self.assertIn(response.json["ai_readiness"]["status"], ("checkpoint_available_unverified", "checkpoint_missing"))
 
     def test_invalid_bbox_date_and_engine_threshold_are_rejected(self):
         cases = [
@@ -48,7 +103,8 @@ class ReliabilityContractTests(unittest.TestCase):
                     self.assertEqual(response.status_code, expected)
 
     def test_both_valid_endpoints_start_as_distinct_async_jobs(self):
-        with patch("app.threading.Thread"):
+        ready = {"status": "configured", "code": None, "configured": True, "auth_method": "local_credentials"}
+        with patch("app.get_gee_configuration", return_value=ready), patch("app.threading.Thread"):
             ai = self.client.post("/api/detect/start", json=self.payload)
             spectral = self.client.post("/api/detect/spectral/start", json=self.payload)
         self.assertEqual(ai.status_code, 200)
@@ -103,6 +159,24 @@ class ReliabilityContractTests(unittest.TestCase):
         self.assertEqual(caught.exception.code, "missing_sar_channels")
         api._validate_imagery(imagery, require_sar=False)
 
+    def test_stac_metadata_keeps_requested_dates_separate_from_scene_datetimes(self):
+        from types import SimpleNamespace
+        first = SimpleNamespace(id="t1-scene", properties={"eo:cloud_cover": 4}, datetime="2021-03-14T06:20:00Z")
+        second = SimpleNamespace(id="t2-scene", properties={"eo:cloud_cover": 6}, datetime="2024-03-16T06:30:00Z")
+        with patch.object(stac_service, "_search_best_scene", side_effect=[(first, []), (second, [])]), \
+             patch.object(stac_service, "_load_s1_means", return_value=([0.0, 0.0, 0.0], 5.0)), \
+             patch.object(stac_service, "_calculate_optimal_dimensions", return_value=(128, 128)), \
+             patch.object(stac_service, "_get_band", return_value=np.full((128, 128), 1200, dtype=np.float32)), \
+             patch.object(stac_service, "_rgb_from_ch_arrays", return_value="rgb"):
+            imagery = stac_service.fetch_imagery(
+                72.8434, 19.1163, 72.8625, 19.1343,
+                "2021-03-15", "2024-03-15", window_days=15, max_cloud=30,
+            )
+        meta = imagery["meta"]
+        self.assertEqual((meta["t1_date"], meta["t2_date"]), ("2021-03-15", "2024-03-15"))
+        self.assertEqual(meta["t1_acquisition_datetime"], first.datetime)
+        self.assertEqual(meta["t2_acquisition_datetime"], second.datetime)
+
     def _imagery(self, s1_used=False):
         tensor = np.full((17, 128, 128), 1200, dtype=np.float32)
         tensor[11] = 0.15
@@ -133,6 +207,14 @@ class ReliabilityContractTests(unittest.TestCase):
     def test_valid_gee_quality_variation_passes_complete_ai_contract(self):
         imagery = self._imagery(s1_used=True)
         api._validate_imagery(imagery, require_sar=True)
+
+    def test_missing_sentinel1_scene_count_is_rejected_before_inference(self):
+        imagery = self._imagery(s1_used=True)
+        imagery["meta"]["t2_s1_scene_count"] = 0
+        with self.assertRaises(api.PipelineError) as caught:
+            api._validate_imagery(imagery, require_sar=True)
+        self.assertEqual(caught.exception.code, "imagery_unavailable")
+        self.assertEqual(caught.exception.details["date"], "2022-01-01")
 
     def test_constant_q_without_raw_nclear_heterogeneity_is_rejected(self):
         imagery = self._imagery(s1_used=True)
@@ -246,48 +328,79 @@ class ReliabilityContractTests(unittest.TestCase):
             self.assertEqual(report["summary"]["ai_success"], 0)
             self.assertEqual(report["summary"]["ai_failed"], 2)
             self.assertTrue(all(row["status"] == "acquisition_failed" for row in report["runs"]))
+            self.assertTrue(all(row["error_code"] == "gee_not_configured" for row in report["runs"]))
             saved = json.loads((root / "output" / "diagnostic_report.json").read_text(encoding="utf-8"))
             self.assertEqual(saved["random_seed"], 77)
             self.assertEqual(len(saved["runs"]), 2)
 
-    def test_ai_job_rejects_stac_without_calling_the_model(self):
+    def test_ai_provider_failure_never_calls_stac_or_the_model(self):
         stac = types.ModuleType("sentinel_stac_service")
-        stac.fetch_imagery = lambda **kwargs: self._imagery(s1_used=False)
+        stac.fetch_imagery = lambda **kwargs: self.fail("AI must never use STAC")
+        gee = types.ModuleType("gee_service")
+        gee.fetch_imagery = lambda **kwargs: (_ for _ in ()).throw(PermissionError("403 project access denied"))
         model = types.ModuleType("inference")
-        model.run_inference = lambda **kwargs: self.fail("AI must not run with placeholder SAR")
-        with patch.dict(os.environ, {"GEE_PROJECT_ID": ""}), patch.dict(sys.modules, {"sentinel_stac_service": stac, "inference": model}):
+        model.run_inference = lambda **kwargs: self.fail("model must not run after provider failure")
+        with patch.dict(sys.modules, {"gee_service": gee, "sentinel_stac_service": stac, "inference": model}):
             api._jobs["stac-ai"] = {"status": "pending", "progress": "", "created_at": 0}
             api._run_job("stac-ai", {**self.payload, "bbox": self.bbox})
         self.assertEqual(api._jobs["stac-ai"]["status"], "error")
-        self.assertEqual(api._jobs["stac-ai"]["error_code"], "missing_sar_channels")
+        self.assertEqual(api._jobs["stac-ai"]["error_code"], "gee_project_access_denied")
+        self.assertEqual(api._jobs["stac-ai"]["meta"]["provider_attempts"][0]["provider"], "Google Earth Engine")
+        self.assertEqual(api._jobs["stac-ai"]["meta"]["diagnostic"]["dates"]["t1"], "2021-01-01")
 
-    def test_ai_provider_fallback_records_actual_provider_and_gee_failure_details(self):
+    def test_ai_provider_failure_is_not_reported_as_provider_fallback(self):
         gee = types.ModuleType("gee_service")
         gee.fetch_imagery = lambda **kwargs: (_ for _ in ()).throw(RuntimeError("403 permission denied for project"))
         stac = types.ModuleType("sentinel_stac_service")
-        def stac_imagery(**kwargs):
-            imagery = self._imagery(s1_used=False)
-            imagery["meta"].update({"provider": "Sentinel-2 STAC", "sar_channels_available": False, "quality_channel_status": "placeholder"})
-            return imagery
-        stac.fetch_imagery = stac_imagery
+        stac.fetch_imagery = lambda **kwargs: self.fail("AI must not fallback to STAC")
         model = types.ModuleType("inference")
-        model.run_inference = lambda **kwargs: self.fail("provider fallback must not bypass multimodal input validation")
+        model.run_inference = lambda **kwargs: self.fail("inference must not run")
         with patch.dict(os.environ, {"GEE_PROJECT_ID": "test-project"}), patch.dict(sys.modules, {"gee_service": gee, "sentinel_stac_service": stac, "inference": model}):
             api._jobs["provider-fallback-ai"] = {"status": "pending", "progress": "", "created_at": 0}
             api._run_job("provider-fallback-ai", {**self.payload, "bbox": self.bbox})
         job = api._jobs["provider-fallback-ai"]
         self.assertEqual(job["status"], "error")
-        self.assertEqual(job["error_code"], "missing_sar_channels")
-        self.assertEqual(job["meta"]["provider"], "Sentinel-2 STAC")
-        self.assertTrue(job["meta"]["provider_fallback"])
+        self.assertEqual(job["error_code"], "gee_project_access_denied")
+        self.assertEqual(job["meta"]["provider"], "Google Earth Engine")
+        self.assertNotIn("provider_fallback", job["meta"])
         attempt = job["meta"]["provider_attempts"][0]
-        self.assertEqual(attempt["status"], "authentication_failed")
+        self.assertEqual(attempt["status"], "gee_project_access_denied")
         self.assertEqual(attempt["error_type"], "RuntimeError")
-        self.assertIn("403 permission denied", attempt["detail"])
+        self.assertIn("cannot access this project", attempt["detail"])
+        self.assertNotIn("403", attempt["detail"])
         status = self.client.get("/api/detect/status/provider-fallback-ai").json
-        self.assertEqual(status["error_code"], "missing_sar_channels")
-        self.assertEqual(status["meta"]["provider"], "Sentinel-2 STAC")
+        self.assertEqual(status["error_code"], "gee_project_access_denied")
+        self.assertEqual(status["meta"]["provider"], "Google Earth Engine")
         self.assertEqual(status["meta"]["provider_attempts"][0]["error_type"], "RuntimeError")
+
+    def test_mocked_exact_maharashtra_request_acquires_gee_then_runs_model(self):
+        exact_payload = {
+            "bbox": {"lon_min": 72.8434, "lat_min": 19.1163, "lon_max": 72.8625, "lat_max": 19.1343},
+            "date_t1": "2021-03-15", "date_t2": "2024-03-15",
+            "window_days": 15, "max_cloud": 30,
+        }
+        imagery = self._imagery(s1_used=True)
+        imagery["meta"].update({"t1_date": "2021-03-15", "t2_date": "2024-03-15"})
+        calls = []
+        gee = types.ModuleType("gee_service")
+        gee.fetch_imagery = lambda **kwargs: (calls.append(kwargs) or imagery)
+        model = types.ModuleType("inference")
+        model.run_inference = lambda **kwargs: {
+            "model_version": "3.2.0", "threshold_source": "manifest",
+            "change_mask_b64": "mask", "binary_mask_b64": "binary",
+            "change_prob_b64": "prob", "overlay_b64": "overlay", "dynamics": {},
+            "stats": {"change_pct": 1.0, "changed_pixels": 1, "total_pixels": 16384, "output_size": [128, 128], "threshold": 0.28},
+        }
+        with patch.dict(sys.modules, {"gee_service": gee, "inference": model}), patch.object(storage_manager, "save_prediction", return_value={"id": "exact"}):
+            api._jobs["maharashtra-exact"] = {"status": "pending", "progress": "", "created_at": 0}
+            api._run_job("maharashtra-exact", exact_payload)
+        self.assertEqual(api._jobs["maharashtra-exact"]["status"], "done")
+        self.assertEqual(len(calls), 1)
+        self.assertEqual((calls[0]["date_t1"], calls[0]["date_t2"]), ("2021-03-15", "2024-03-15"))
+        self.assertEqual(calls[0]["window_days"], 15)
+        self.assertEqual(calls[0]["max_cloud"], 30)
+        self.assertEqual(calls[0]["lon_min"], 72.8434)
+        self.assertEqual(api._jobs["maharashtra-exact"]["result"]["engine"], "geonexus_ai")
 
     def test_gee_quality_failure_returns_provider_date_and_channel(self):
         imagery = self._imagery(s1_used=True)
@@ -343,7 +456,8 @@ class ReliabilityContractTests(unittest.TestCase):
             "overlay_b64": "overlay", "dynamics": {},
             "stats": {"change_pct": 4.0, "changed_pixels": 10, "total_pixels": 100, "output_size": [128, 128], "threshold": 0.2},
         }
-        with patch.dict(os.environ, {"GEE_PROJECT_ID": "test-project"}), patch.dict(sys.modules, {
+        ready = {"status": "configured", "code": None, "configured": True, "auth_method": "local_credentials"}
+        with patch.dict(os.environ, {"GEE_PROJECT_ID": "test-project"}), patch("app.get_gee_configuration", return_value=ready), patch.dict(sys.modules, {
             "gee_service": gee, "sentinel_stac_service": stac, "spectral_cd": spectral,
         }), patch.object(storage_manager, "save_prediction", return_value={"id": "spec-test"}):
             api._jobs["spectral-fallback"] = {"status": "pending", "progress": "", "created_at": 0}
@@ -354,7 +468,8 @@ class ReliabilityContractTests(unittest.TestCase):
         self.assertEqual(job["result"]["engine_label"], "Spectral Index Analysis (S-CVA)")
         self.assertEqual(job["result"]["meta"]["provider"], "Sentinel-2 STAC")
         self.assertTrue(job["result"]["meta"]["provider_fallback"])
-        self.assertEqual(job["result"]["meta"]["provider_attempts"][0]["status"], "authentication_failed")
+        self.assertEqual(job["result"]["meta"]["provider_attempts"][0]["status"], "gee_project_access_denied")
+        self.assertEqual(job["result"]["meta"]["t1_date"], self.payload["date_t1"])
 
     def test_legacy_database_migrates_as_unknown_and_matches_by_engine(self):
         with tempfile.TemporaryDirectory() as temp_dir:

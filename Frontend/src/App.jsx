@@ -61,8 +61,11 @@ export default function App() {
   const [loading, setLoading] = useState(false);
   const [liveProgress, setLiveProgress] = useState('');
   const [error, setError] = useState(null);
+  const [errorCode, setErrorCode] = useState(null);
   const [result, setResult] = useState(null);
   const [apiStatus, setApiStatus] = useState('checking');
+  const [geeStatus, setGeeStatus] = useState('checking');
+  const [checkpointStatus, setCheckpointStatus] = useState('checking');
   const [showMapToast, setShowMapToast] = useState(false);
 
   // ── Saved / Cached Predictions State ──────────────────────────
@@ -148,7 +151,11 @@ export default function App() {
   // ── Permanent SQLite server sync & health check on mount ──────
   useEffect(() => {
     axios.get(`${API}/api/health`, { timeout: 5000 })
-      .then(({ data }) => setApiStatus(data.model_checkpoint_available ? 'ok' : 'degraded'))
+      .then(({ data }) => {
+        setApiStatus('ok');
+        setGeeStatus(data.ai_readiness?.gee?.status || 'unknown');
+        setCheckpointStatus(data.ai_readiness?.checkpoint_available ? 'present_unverified' : 'missing');
+      })
       .catch(() => setApiStatus('error'));
 
     // Pull permanent database predictions from server disk
@@ -171,6 +178,7 @@ export default function App() {
       return;
     }
     setError(null);
+    setErrorCode(null);
 
     const latDelta = (size / 2) / 111.32;
     const lonDelta = (size / 2) / (111.32 * Math.max(0.1, Math.cos((lat * Math.PI) / 180)));
@@ -201,6 +209,7 @@ export default function App() {
       return;
     }
     setError(null);
+    setErrorCode(null);
 
     setBbox({
       lon_min: lonMin,
@@ -239,6 +248,7 @@ export default function App() {
     }
 
     setError(null);
+    setErrorCode(null);
     setResult(null);
     setSelectedPredictionId('active');
     setLiveProgress('Submitting satellite change detection job…');
@@ -282,7 +292,9 @@ export default function App() {
             } else if (statusData.status === 'error') {
               clearInterval(pollInterval);
               clearTimeout(pollTimeout);
-              reject(new Error(statusData.error || 'Job failed on server'));
+              const failure = new Error(statusData.error || 'Job failed on server');
+              failure.code = statusData.error_code;
+              reject(failure);
             }
           } catch (pollErr) {
             clearInterval(pollInterval);
@@ -323,6 +335,7 @@ export default function App() {
       if (pollTimeout) clearTimeout(pollTimeout);
       const msg = err.response?.data?.error || err.message || 'Unexpected error';
       setError(msg);
+      setErrorCode(err.response?.data?.error_code || err.code || null);
     } finally {
       setLoading(false);
     }
@@ -341,6 +354,7 @@ export default function App() {
     }
 
     setError(null);
+    setErrorCode(null);
     setResult(null);
     setSelectedPredictionId('active');
     setLiveProgress('Submitting enhanced spectral analysis job…');
@@ -411,6 +425,7 @@ export default function App() {
       if (pollTimeout) clearTimeout(pollTimeout);
       const msg = err.response?.data?.error || err.message || 'Unexpected error';
       setError(msg);
+      setErrorCode(err.response?.data?.error_code || err.code || null);
     } finally {
       setLoading(false);
     }
@@ -513,9 +528,9 @@ export default function App() {
         {/* ── API Status ──────────────────────────────────── */}
         <div className="navbar-status">
           <div className="status-dot" style={{
-            background: apiStatus === 'ok' ? 'var(--c-green)' : apiStatus === 'error' ? 'var(--c-red)' : 'var(--c-amber)',
+            background: apiStatus === 'error' ? 'var(--c-red)' : apiStatus === 'ok' && geeStatus === 'configured' && checkpointStatus === 'present_unverified' ? 'var(--c-green)' : 'var(--c-amber)',
           }} />
-          {apiStatus === 'ok' ? 'API Online · Weights Available' : apiStatus === 'degraded' ? 'API Online · Model Missing' : apiStatus === 'error' ? 'API Offline' : 'Connecting…'}
+          {apiStatus === 'error' ? 'API Offline' : apiStatus === 'checking' ? 'Connecting…' : `API Online · ${geeStatus === 'not_configured' ? 'GEE not configured' : geeStatus === 'credentials_missing' ? 'GEE credentials missing' : geeStatus === 'service_account_invalid' ? 'GEE key invalid' : geeStatus === 'configured' ? 'GEE configured · verify on run' : 'AI provider status unknown'} · ${checkpointStatus === 'missing' ? 'checkpoint missing' : checkpointStatus === 'present_unverified' ? 'checkpoint present · verify on run' : 'checking model'}`}
         </div>
       </nav>
 
@@ -850,6 +865,11 @@ export default function App() {
                   <span className="error-icon">⚠</span>
                   <span>{error}</span>
                 </div>
+                {['gee_not_configured', 'gee_credentials_missing', 'gee_service_account_invalid'].includes(errorCode) && (
+                  <p role="status" style={{ margin: 0, color: 'var(--c-text2)', fontSize: '0.78rem', lineHeight: 1.5 }}>
+                    This trained AI model needs authenticated Google Earth Engine access to real Sentinel-1 and Sentinel-2 inputs. Configure GEE before retrying; spectral analysis remains available separately.
+                  </p>
+                )}
                 <div style={{ display: 'flex', gap: '0.5rem', width: '100%' }}>
                   <button
                     className="btn btn-primary"
@@ -870,7 +890,7 @@ export default function App() {
                   <button
                     className="btn btn-ghost"
                     style={{ fontSize: '0.8rem', padding: '0.4rem 0.8rem' }}
-                    onClick={() => setError(null)}
+                    onClick={() => { setError(null); setErrorCode(null); }}
                   >
                     ✕ Dismiss
                   </button>
@@ -1051,7 +1071,7 @@ export default function App() {
                   <span style={{ display: 'flex', gap: '.5rem', flexWrap: 'wrap' }}>
                     <button className="btn btn-primary" onClick={() => handleAnalyze({ bypassCache: true })} disabled={loading || !bbox}>Retry AI</button>
                     <button className="btn btn-spectral" onClick={() => handleSpectralAnalyze({ bypassCache: true })} disabled={loading || !bbox}>Run Spectral Analysis</button>
-                    <button className="btn btn-ghost" onClick={() => setError(null)}>Dismiss</button>
+                    <button className="btn btn-ghost" onClick={() => { setError(null); setErrorCode(null); }}>Dismiss</button>
                   </span>
                 </div>
               )}

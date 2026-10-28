@@ -52,7 +52,7 @@ flowchart TD
 
     subgraph Engines["Analytical Processing Engines"]
         GEE["Google Earth Engine API\n(Sentinel-2 L2A Harmonized + Dynamic World)"]
-        STAC["Element84 Sentinel-2 STAC\n(Spectral imagery fallback)"]
+        STAC["Element84 Sentinel-2 STAC\n(Explicit spectral analysis provider)"]
         DL["MH-DAPT-CD v3.2 Siamese CNN\n(PyTorch Inference Engine)"]
         SCVA["Spectral Change Vector Analysis (S-CVA)\n(Physical Index Engine)"]
     end
@@ -129,7 +129,7 @@ Major Project/
 - **Python**: Version 3.10 or 3.11
 - **Node.js**: Version 18 or higher (with `npm`)
 - **Git & Git LFS**: Ensure Git Large File Storage is installed (`git lfs --version`)
-- **Google Earth Engine Account**: Required for live AI inference because its model contract includes real Sentinel-1 features. Sentinel-2 STAC is available to the separately selected spectral method.
+- **Google Earth Engine Account and project**: Required for live AI inference because its model contract includes real Sentinel-1 features. Sentinel-2 STAC is available to the separately selected spectral method; AI does not fall back to STAC.
 
 ---
 

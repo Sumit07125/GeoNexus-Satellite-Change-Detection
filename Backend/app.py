@@ -19,12 +19,10 @@ from dotenv import load_dotenv
 
 load_dotenv(override=True)
 
-# Confirm .env loaded
-_gee_proj = os.environ.get('GEE_PROJECT_ID', '').strip()
-if not _gee_proj or _gee_proj in ('your-gcp-project-id', 'NOT SET', 'YOUR_GEE_PROJECT_ID'):
-    print("[ENV] ℹ GEE_PROJECT_ID not set in .env — defaulting to Sentinel-2 AWS/Planetary Computer open data.")
-else:
-    print(f"[ENV] GEE_PROJECT_ID configured: '{_gee_proj}'")
+from gee_config import get_gee_configuration
+
+_startup_gee = get_gee_configuration()
+print(f"[ENV] Google Earth Engine readiness: {_startup_gee['status']}")
 
 app = Flask(__name__)
 
@@ -300,11 +298,16 @@ def _trim_jobs():
 
 
 def _run_job(job_id: str, payload: dict):
-    """Background thread that runs STAC fetch + inference."""
+    """Background thread for the trained AI engine. Only GEE supplies AI inputs."""
     try:
-        # Use STAC (free, no billing) — GEE as optional fallback
-        from sentinel_stac_service import fetch_imagery as stac_fetch
-        from inference import run_inference
+        try:
+            from gee_service import fetch_imagery as gee_fetch
+        except Exception as provider_import_error:
+            raise PipelineError("gee_api_unavailable", "The Google Earth Engine client is unavailable in this backend environment.") from provider_import_error
+        try:
+            from inference import run_inference
+        except Exception as model_import_error:
+            raise PipelineError("model_unavailable", "The Geo-Nexus model runtime could not be loaded. Check the backend model dependencies and retry.") from model_import_error
 
         bbox        = payload["bbox"]
         date_t1     = payload["date_t1"]
@@ -318,82 +321,53 @@ def _run_job(job_id: str, payload: dict):
         if threshold is not None:
             threshold = float(threshold)
 
-        # ── Step 1: Fetch satellite imagery (GEE first, STAC fallback) ───────
+        # ── Step 1: Acquire the real multimodal inputs from GEE ───────────────
         _update_job(job_id, status="running",
-                    progress="🛰 Fetching satellite imagery…")
+                    progress="Checking Earth Engine access, then acquiring Sentinel-2 and Sentinel-1 imagery…")
         app.logger.info(f"[{job_id}] Satellite fetch for '{loc_name}'")
 
-        imagery = None
-        provider = None
-        gee_failure = None
         provider_attempts = []
-
-        # Strategy 1: Try Google Earth Engine first
-        gee_proj = os.environ.get("GEE_PROJECT_ID", "").strip()
-        if gee_proj and gee_proj not in ('', 'NOT SET', 'YOUR_GEE_PROJECT_ID'):
-            try:
-                _update_job(job_id, progress="🛰 Attempting fetch via Google Earth Engine…")
-                from gee_service import fetch_imagery as gee_fetch
-                imagery = gee_fetch(
-                    lon_min=float(bbox["lon_min"]), lat_min=float(bbox["lat_min"]),
-                    lon_max=float(bbox["lon_max"]), lat_max=float(bbox["lat_max"]),
-                    date_t1=date_t1, date_t2=date_t2,
-                    window_days=window_days, max_cloud=max_cloud,
-                    thumb_size=thumb_size,
-                )
-                provider = "Google Earth Engine"
-                provider_attempts.append({"provider": provider, "status": "success"})
-                app.logger.info(f"[{job_id}] Google Earth Engine fetch succeeded!")
-            except Exception as gee_err:
-                if "single-request 10 m model grid limit" in str(gee_err):
-                    raise PipelineError("area_too_large", "This area is too large for one 10 m AI request. Draw a smaller bbox and retry.") from gee_err
-                gee_failure = gee_err
-                attempt = {"provider": "Google Earth Engine", "status": _provider_error_kind(gee_err), "error_type": type(gee_err).__name__, "detail": _safe_provider_detail(gee_err)}
-                provider_attempts.append(attempt)
-                app.logger.warning("provider_attempt=%s", json.dumps({"job_id": job_id, **attempt}, separators=(",", ":")))
-                _update_job(job_id, progress="🛰 GEE permission error — falling back to Sentinel-2 Open Data…")
-        else:
-            attempt = {"provider": "Google Earth Engine", "status": "not_configured", "detail": "GEE_PROJECT_ID is not configured; Sentinel-2 STAC will be tried."}
-            provider_attempts.append(attempt)
-            app.logger.info("provider_attempt=%s", json.dumps({"job_id": job_id, **attempt}, separators=(",", ":")))
-
-        # Strategy 2: High-speed Sentinel-2 STAC (free, no auth, no billing required)
-        if imagery is None:
-            from sentinel_stac_service import fetch_imagery as stac_fetch
-            def update_progress(msg):
-                _update_job(job_id, progress=msg)
-            try:
-                imagery = stac_fetch(
+        meta = {
+            "provider": "Google Earth Engine",
+            "t1_date": date_t1,
+            "t2_date": date_t2,
+            "provider_attempts": provider_attempts,
+        }
+        _update_job(job_id, progress="Acquiring T1/T2 Sentinel-2 and Sentinel-1 composites…")
+        try:
+            imagery = gee_fetch(
                 lon_min=float(bbox["lon_min"]), lat_min=float(bbox["lat_min"]),
                 lon_max=float(bbox["lon_max"]), lat_max=float(bbox["lat_max"]),
                 date_t1=date_t1, date_t2=date_t2,
                 window_days=window_days, max_cloud=max_cloud,
                 thumb_size=thumb_size,
-                progress_cb=update_progress,
-                )
-                provider = "Sentinel-2 STAC"
-                provider_attempts.append({"provider": provider, "status": "success"})
-            except Exception as stac_err:
-                app.logger.exception("[%s] Sentinel-2 STAC acquisition failed", job_id)
-                attempt = {"provider": "Sentinel-2 STAC", "status": _provider_error_kind(stac_err), "error_type": type(stac_err).__name__, "detail": _safe_provider_detail(stac_err)}
-                provider_attempts.append(attempt)
-                app.logger.warning("provider_attempt=%s", json.dumps({"job_id": job_id, **attempt}, separators=(",", ":")))
-                if gee_failure:
-                    if _provider_error_kind(gee_failure) == "authentication_failed":
-                        raise PipelineError("authentication_failed", "Google Earth Engine authentication failed, and Sentinel-2 STAC could not provide imagery for both dates.") from stac_err
-                    raise PipelineError("providers_unavailable", "Imagery acquisition failed for both Google Earth Engine and Sentinel-2 STAC. Check provider access and scene availability.") from stac_err
-                raise PipelineError("imagery_unavailable", "Sentinel-2 STAC could not find or retrieve usable imagery for both dates.") from stac_err
+            )
+            meta = imagery.get("meta") or meta
+            meta.update({"provider": "Google Earth Engine", "t1_date": date_t1, "t2_date": date_t2})
+            provider_attempts.append({"provider": "Google Earth Engine", "status": "success"})
+            app.logger.info("provider_attempt=%s", json.dumps({"job_id": job_id, "provider": "Google Earth Engine", "status": "success"}))
+        except Exception as gee_err:
+            from gee_config import classify_gee_error
+            if "single-request 10 m model grid limit" in str(gee_err):
+                code, message = "area_too_large", "This area is too large for one 10 m AI request. Draw a smaller bbox and retry."
+            elif getattr(gee_err, "code", None) and getattr(gee_err, "message", None):
+                code, message = gee_err.code, gee_err.message
+            else:
+                code, message = classify_gee_error(gee_err)
+            attempt = {"provider": "Google Earth Engine", "status": code, "error_type": type(gee_err).__name__, "detail": message}
+            provider_attempts.append(attempt)
+            meta["provider_attempts"] = provider_attempts
+            app.logger.warning("provider_attempt=%s", json.dumps({"job_id": job_id, **attempt}, separators=(",", ":")))
+            raise PipelineError(code, message, {"provider": "Google Earth Engine", "dates": {"t1": date_t1, "t2": date_t2}, "window_days": window_days, "max_cloud_pct": max_cloud}) from gee_err
 
-        meta = imagery.get("meta") or {}
-        meta["provider"] = provider or meta.get("provider", "unknown")
-        meta["provider_fallback"] = bool(gee_failure and provider == "Sentinel-2 STAC")
         meta["provider_attempts"] = provider_attempts
         meta["input_channels"] = 17
         meta["input_channel_order"] = INPUT_CHANNEL_ORDER
         meta["ai_input_contract"] = "complete" if meta.get("s1_used", False) else "incomplete"
+        _update_job(job_id, progress="Validating the trained 17-channel T1/T2 input contract…")
         _validate_imagery(imagery, require_sar=True)
 
-        _update_job(job_id, progress="🤖 Running GeoNexus v3.2 change detection model…")
+        _update_job(job_id, progress="Running Geo-Nexus v3.2 checkpoint inference…")
         app.logger.info(f"[{job_id}] Imagery fetched. Running inference…")
 
         # ── Step 2: Model inference ───────────────────────────────────────────
@@ -459,8 +433,7 @@ def _run_job(job_id: str, payload: dict):
         _update_job(job_id, status="done", progress="✅ Complete", result=outcome_result)
 
     except Exception as e:
-        tb = traceback.format_exc()
-        app.logger.error(f"[{job_id}] ERROR: {e}\n{tb}")
+        app.logger.error("[%s] AI job failed (%s): %s", job_id, getattr(e, "code", "pipeline_failed"), type(e).__name__)
         code = e.code if isinstance(e, PipelineError) else "pipeline_failed"
         message = str(e) if isinstance(e, PipelineError) else "Geo-Nexus AI analysis failed. Check imagery availability and server logs, then retry."
         failure_meta = {key: meta[key] for key in ("provider", "provider_fallback", "input_channels", "s1_used", "preprocessing_id", "t1_date", "t2_date", "quality_channel", "quality_channel_status") if "meta" in locals() and key in meta}
@@ -501,9 +474,10 @@ def _run_spectral_job(job_id: str, payload: dict):
         gee_failure = None
         provider_attempts = []
 
-        # Try GEE first if configured
-        gee_proj = os.environ.get("GEE_PROJECT_ID", "").strip()
-        if gee_proj and gee_proj not in ('', 'NOT SET', 'YOUR_GEE_PROJECT_ID'):
+        # GEE is preferred when configured; STAC fallback is specific to this
+        # explicitly selected optical spectral engine.
+        gee_configuration = get_gee_configuration()
+        if gee_configuration.get("configured"):
             try:
                 _update_job(job_id, progress="🛰 Attempting fetch via Google Earth Engine…")
                 from gee_service import fetch_imagery as gee_fetch
@@ -518,9 +492,13 @@ def _run_spectral_job(job_id: str, payload: dict):
                 provider_attempts.append({"provider": provider, "status": "success"})
             except Exception as gee_err:
                 gee_failure = gee_err
-                provider_attempts.append({"provider": "Google Earth Engine", "status": _provider_error_kind(gee_err)})
+                from gee_config import classify_gee_error
+                gee_code, gee_message = classify_gee_error(gee_err)
+                provider_attempts.append({"provider": "Google Earth Engine", "status": gee_code, "detail": gee_message})
                 app.logger.warning(f"[spectral/{job_id}] GEE unavailable; falling back to STAC")
                 _update_job(job_id, progress="🛰 GEE unavailable — using Sentinel-2 Open Data…")
+        else:
+            provider_attempts.append({"provider": "Google Earth Engine", "status": gee_configuration["code"], "detail": gee_configuration["message"]})
 
         # Sentinel-2 STAC fallback (free, no auth)
         if imagery is None:
@@ -538,6 +516,7 @@ def _run_spectral_job(job_id: str, payload: dict):
                 )
                 provider = "Sentinel-2 STAC"
                 provider_attempts.append({"provider": provider, "status": "success"})
+                (imagery.get("meta") or {}).update({"t1_date": date_t1, "t2_date": date_t2})
             except Exception as stac_err:
                 app.logger.exception("[spectral/%s] STAC acquisition failed", job_id)
                 provider_attempts.append({"provider": "Sentinel-2 STAC", "status": _provider_error_kind(stac_err)})
@@ -633,14 +612,25 @@ def _run_spectral_job(job_id: str, payload: dict):
 def health():
     model_dir = os.path.join(os.path.dirname(__file__), os.environ.get("MODEL_DIR", "Model/geonexus_v3_2_k30"))
     checkpoint = os.path.join(model_dir, os.environ.get("MODEL_CHECKPOINT", "mh_fewshot_best_k30.pth"))
+    gee = get_gee_configuration()
+    checkpoint_available = os.path.isfile(checkpoint)
     return jsonify({
         "status": "ok",
         "service": "Geo-Nexus Change Detection API",
         "version": "3.2.0",
         "model": os.environ.get("MODEL_CHECKPOINT", "mh_fewshot_best_k30.pth"),
-        "model_checkpoint_available": os.path.isfile(checkpoint),
+        "model_checkpoint_available": checkpoint_available,
+        "ai_readiness": {
+            # File existence alone does not validate checkpoint compatibility;
+            # EE access and strict checkpoint loading are verified per run.
+            "ready": False,
+            "status": gee["status"] if not gee.get("configured") else ("checkpoint_available_unverified" if checkpoint_available else "checkpoint_missing"),
+            "gee": {key: value for key, value in gee.items() if key in ("status", "code", "configured", "message")},
+            "checkpoint_available": checkpoint_available,
+            "note": "Earth Engine authentication, project access, imagery, and strict checkpoint loading are verified during an analysis run.",
+        },
         "engines": ["geonexus_ai", "spectral_scva"],
-        "ai_requires": "Google Earth Engine imagery with real Sentinel-1 and spatial quality channels",
+        "ai_requires": "Google Earth Engine imagery with real Sentinel-1 and trained quality inputs",
     })
 
 
@@ -652,6 +642,15 @@ def detect_start():
     """
     try:
         body = _validate_payload(request.get_json(silent=True), "geonexus_ai")
+
+        readiness = get_gee_configuration()
+        if not readiness.get("configured"):
+            return jsonify({
+                "success": False,
+                "error": readiness["message"],
+                "error_code": readiness["code"],
+                "meta": {"provider": "Google Earth Engine", "provider_attempts": [{"provider": "Google Earth Engine", "status": readiness["code"]}], "requested_dates": {"t1": body["date_t1"], "t2": body["date_t2"]}},
+            }), 503
 
         _trim_jobs()
         job_id = str(uuid.uuid4())

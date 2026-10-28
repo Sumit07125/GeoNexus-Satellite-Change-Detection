@@ -38,7 +38,17 @@ test('AI retry and spectral recovery remain explicit and target separate endpoin
   assert.match(app, /ANALYSIS_METHODS\.spectral_scva\.endpoint/);
   assert.match(app, /handleSpectralAnalyze\(\{ bypassCache: true \}\)/);
   assert.match(app, /cachedSpectralMatch && !bypassCache/);
-  assert.match(app, /onClick=\{\(\) => setError\(null\)\}[\s\S]{0,60}Dismiss/);
+  assert.match(app, /onClick=\{\(\) => \{ setError\(null\); setErrorCode\(null\); \}\}[\s\S]{0,80}Dismiss/);
+});
+
+test('AI preflight status is distinct from backend health and structured GEE errors are surfaced', async () => {
+  const app = await readFile(new URL('../src/App.jsx', import.meta.url), 'utf8');
+  assert.match(app, /data\.ai_readiness\?\.gee\?\.status/);
+  assert.match(app, /GEE not configured/);
+  assert.match(app, /GEE credentials missing/);
+  assert.match(app, /setErrorCode\(err\.response\?\.data\?\.error_code/);
+  assert.match(app, /gee_credentials_missing/);
+  assert.match(app, /Configure GEE before retrying/);
 });
 
 test('results and history render explicit source labels including unknown legacy rows', async () => {
