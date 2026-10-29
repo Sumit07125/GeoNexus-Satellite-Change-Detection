@@ -14,6 +14,38 @@
 
 ---
 
+## Live AI acquisition requirements and troubleshooting
+
+Geo-Nexus AI at `/api/detect/start` requires a configured Earth Engine project and a compatible real Sentinel-2 plus Sentinel-1 pair. Its unchanged 17-channel contract is B2–B12, NDVI, NDBI, VV, VH, VH_VV, and trained Q. Spectral Index Analysis (S-CVA) is an independent method at `/api/detect/spectral/start`; Sentinel-2 STAC can supply it, but it is never substituted for neural inference.
+
+For AI, each bbox dimension must cover at least 128 nominal 10 m pixels (1.28 km); an undersized selection is rejected before Earth Engine is queried. For arbitrary AOIs the backend queries descending IW VV/VH scenes independently in both date windows and chooses one shared relative orbit. Only the exact Pune, Satara, and Vidarbha benchmark extents retain their frozen research orbits, which are never replaced if unavailable. Earth Engine initialization success does not guarantee that a particular collection, metadata query, quality product, or imagery download is available.
+
+From `Backend/`, investigate the current Sentinel-1 metadata path with the same `.env` and Python environment used for Flask:
+
+```powershell
+python diagnostics/test_s1_orbit_query.py --t1 2021-03-15 --t2 2024-03-15 --window-days 15 --max-cloud 30 --bbox 72.8432 19.1113 72.8527 19.1203
+```
+
+The tool reports each failing operation and never downloads rasters or runs inference. Query errors (for example `s1_t1_orbit_histogram`) must be resolved as API/auth/access failures; they do not mean the orbit set is empty. `gee_s1_no_scenes_t1/t2` means that date query succeeded but found no eligible scenes. `gee_no_common_s1_orbit` means both orbit queries succeeded but their sets do not overlap. Widen the time window explicitly or choose other dates. For `area_too_small`, enlarge the selected bounds; do not resample a small AOI to imitate 10 m coverage.
+
+The backend reports its non-secret build identifier in startup logs and `/api/health`. A local Git build includes a `-dirty` suffix when files are modified; set `GEONEXUS_BUILD_ID` for deployments without local Git metadata. Backend credentials remain local and are not shown in health output.
+
+Run automated checks from the project folders:
+
+```powershell
+cd Backend
+python -m unittest discover -s tests -p test_reliability_contracts.py -v
+cd ..\Frontend
+npm ci
+npm run test
+npm run lint
+npm run build
+```
+
+Mocked tests verify request handling, orbit-query stages, engine identity, and the model contract. They do not validate live imagery or Earth Engine access. The live diagnostic requires Earth Engine credentials visible to the Python interpreter running it.
+
+---
+
 ## Key Highlights
 
 - **Dual-Engine Analytical Framework**:
@@ -60,10 +92,10 @@ flowchart TD
     UI -->|Coordinates, Dates, Parameters| Router
     Router --> Cache
     Router --> Orchestrator
-    Orchestrator --> GEE
-    Orchestrator --> STAC
-    GEE --> SCVA
-    Orchestrator --> DL
+    Orchestrator -->|AI endpoint| GEE
+    GEE --> DL
+    Orchestrator -->|explicit spectral endpoint| STAC
+    STAC --> SCVA
     DL --> Router
     SCVA --> Router
     Router --> Filter
@@ -173,7 +205,7 @@ git lfs pull
    ```bash
    cp .env.example .env
    ```
-   *(Optional)* If you wish to fetch live imagery directly from Google Earth Engine, authenticate your CLI and set your GCP Project ID in `.env`:
+   For the primary AI method, authenticate the same local Earth Engine account used by the backend and set a valid GCP Project ID in `.env`. A placeholder project ID or missing credentials leaves AI unavailable; the separate spectral method can still use Sentinel-2 STAC:
    ```bash
    earthengine authenticate
    ```
@@ -219,11 +251,11 @@ git lfs pull
    - Click and drag on the map or use the rectangle tool to draw your bounding box.
 3. **Configure Temporal Windows**:
    - Choose **Date T1 (Before)** and **Date T2 (After)**.
-   - Adjust cloud coverage tolerance (default $\le 20\%$) and temporal search radius.
+   - Adjust cloud coverage tolerance (default 30%) and temporal search radius. The AI bbox must be at least 1.28 km in both dimensions at nominal 10 m resolution.
 4. **Execute Detection**:
-   - Click **Analyze Change Detection**.
+   - Click **Run Geo-Nexus AI Analysis** for the trained model. Spectral Index Analysis (S-CVA) is available as an explicit alternative in Advanced Analysis.
    - If using cached regions, results will load instantly.
-   - If querying live satellite feeds via GEE, ingestion, index computation, and Siamese forward passes will complete in ~30–60 seconds.
+   - If a live GEE query fails, open **Acquisition diagnostics** and use its reported operation, stage, and request ID to troubleshoot. Initialization success does not guarantee that every collection query or date window is available.
 5. **Explore & Filter Results**:
    - Inspect the **Change Heatmap** and **Confidence Distribution**.
    - Use the **T2 Overlap Mask** with individual category checkboxes to isolate:

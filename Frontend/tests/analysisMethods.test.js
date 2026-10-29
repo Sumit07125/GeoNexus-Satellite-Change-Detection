@@ -38,7 +38,7 @@ test('AI retry and spectral recovery remain explicit and target separate endpoin
   assert.match(app, /ANALYSIS_METHODS\.spectral_scva\.endpoint/);
   assert.match(app, /handleSpectralAnalyze\(\{ bypassCache: true \}\)/);
   assert.match(app, /cachedSpectralMatch && !bypassCache/);
-  assert.match(app, /onClick=\{\(\) => \{ setError\(null\); setErrorCode\(null\); \}\}[\s\S]{0,80}Dismiss/);
+  assert.match(app, /onClick=\{\(\) => \{ setError\(null\); setErrorCode\(null\); setErrorMeta\(null\); \}\}[\s\S]{0,80}Dismiss/);
 });
 
 test('AI preflight status is distinct from backend health and structured GEE errors are surfaced', async () => {
@@ -49,6 +49,28 @@ test('AI preflight status is distinct from backend health and structured GEE err
   assert.match(app, /setErrorCode\(err\.response\?\.data\?\.error_code/);
   assert.match(app, /gee_credentials_missing/);
   assert.match(app, /Configure GEE before retrying/);
+});
+
+test('T1 Sentinel-1 query errors show a metadata failure and expandable sanitized diagnostics', async () => {
+  const app = await readFile(new URL('../src/App.jsx', import.meta.url), 'utf8');
+  assert.match(app, /isT1OrbitQueryFailure/);
+  assert.match(app, /Earth Engine failed while querying Sentinel-1 metadata for T1/);
+  assert.match(app, /<details className="acquisition-diagnostics">/);
+  for (const field of ['operation', 'exception_type', 'technical_reason', 'search_windows', 't1_s1_count_before_filters', 't1_s1_count_after_iw_desc_vv_vh_filters', 'request_id']) {
+    assert.ok(app.includes(field), `diagnostic should display ${field}`);
+  }
+  assert.match(app, /Was T2 Sentinel-1 queried\?/);
+  assert.match(app, /No; T1 failed first/);
+  assert.match(app, /metadata-query failure; it does not mean no orbits were found/i);
+});
+
+test('backend build ID is displayed and request payload uses the active bbox', async () => {
+  const app = await readFile(new URL('../src/App.jsx', import.meta.url), 'utf8');
+  assert.match(app, /data\.build_id/);
+  assert.match(app, /title=\{`Backend build \$\{backendBuildId\}`\}/);
+  assert.match(app, /const payload = \{[\s\S]{0,120}bbox,/);
+  assert.match(app, /handleCenterBoxSizeChange/);
+  assert.match(app, /setBbox\(createSquareBbox\(lat, lon, Number\(value\)\)\)/);
 });
 
 test('results and history render explicit source labels including unknown legacy rows', async () => {

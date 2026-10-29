@@ -68,6 +68,7 @@ export default function App() {
   const [apiStatus, setApiStatus] = useState('checking');
   const [geeStatus, setGeeStatus] = useState('checking');
   const [checkpointStatus, setCheckpointStatus] = useState('checking');
+  const [backendBuildId, setBackendBuildId] = useState('unknown');
   const [showMapToast, setShowMapToast] = useState(false);
 
   // ── Saved / Cached Predictions State ──────────────────────────
@@ -135,14 +136,21 @@ export default function App() {
     const resolved = typeof nextBbox === 'function' ? nextBbox(bbox) : nextBbox;
     setBboxState(resolved);
     if (resolved) {
-      const cLat = ((resolved.lat_min + resolved.lat_max) / 2).toFixed(4);
-      const cLon = ((resolved.lon_min + resolved.lon_max) / 2).toFixed(4);
+      const cLat = ((resolved.lat_min + resolved.lat_max) / 2).toFixed(6);
+      const cLon = ((resolved.lon_min + resolved.lon_max) / 2).toFixed(6);
       setCoordLat(cLat);
       setCoordLon(cLon);
-      setBoundLatMin(resolved.lat_min.toFixed(4));
-      setBoundLatMax(resolved.lat_max.toFixed(4));
-      setBoundLonMin(resolved.lon_min.toFixed(4));
-      setBoundLonMax(resolved.lon_max.toFixed(4));
+      setBoundLatMin(resolved.lat_min.toFixed(6));
+      setBoundLatMax(resolved.lat_max.toFixed(6));
+      setBoundLonMin(resolved.lon_min.toFixed(6));
+      setBoundLonMax(resolved.lon_max.toFixed(6));
+      const dimensions = bboxDimensionsKm(resolved);
+      const sizeOptions = ['0.5', '1.0', '2.0', '5.0', '10.0'];
+      const matched = sizeOptions.find((option) =>
+        Math.abs(Number(option) - dimensions.widthKm) < 0.025 &&
+        Math.abs(Number(option) - dimensions.heightKm) < 0.025
+      );
+      setCoordSizeKm(matched || 'custom');
     }
   }, [bbox]);
 
@@ -155,6 +163,7 @@ export default function App() {
     axios.get(`${API}/api/health`, { timeout: 5000 })
       .then(({ data }) => {
         setApiStatus('ok');
+        setBackendBuildId(data.build_id || 'unknown');
         setGeeStatus(data.ai_readiness?.gee?.status || 'unknown');
         setCheckpointStatus(data.ai_readiness?.checkpoint_available ? 'present_unverified' : 'missing');
       })
@@ -173,7 +182,10 @@ export default function App() {
   const handleApplyCenterCoordinates = () => {
     const lat = parseFloat(coordLat);
     const lon = parseFloat(coordLon);
-    const size = parseFloat(coordSizeKm) || 2.0;
+    const currentExtent = bboxDimensionsKm(bbox);
+    const size = coordSizeKm === 'custom' && currentExtent
+      ? (currentExtent.widthKm + currentExtent.heightKm) / 2
+      : parseFloat(coordSizeKm) || 2.0;
 
     if (isNaN(lat) || isNaN(lon) || lat < -90 || lat > 90 || lon < -180 || lon > 180) {
       setError('Please enter valid numeric latitude (-90 to 90) and longitude (-180 to 180).');
@@ -181,11 +193,92 @@ export default function App() {
     }
     setError(null);
     setErrorCode(null);
+    setErrorMeta(null);
 
     setBbox(createSquareBbox(lat, lon, size));
     if (!locationName) {
       setLocationName(`Location (${lat.toFixed(3)}°, ${lon.toFixed(3)}°)`);
     }
+  };
+
+  const handleCenterInputChange = (field, value) => {
+    if (field === 'latitude') setCoordLat(value);
+    else setCoordLon(value);
+    if (coordMode !== 'center') return;
+    const latText = field === 'latitude' ? value : coordLat;
+    const lonText = field === 'longitude' ? value : coordLon;
+    const latValue = Number(latText);
+    const lonValue = Number(lonText);
+    if (!latText.trim() || !lonText.trim() || !Number.isFinite(latValue) || !Number.isFinite(lonValue) || latValue < -90 || latValue > 90 || lonValue < -180 || lonValue > 180) {
+      setBboxState(null);
+      return;
+    }
+    const size = coordSizeKm === 'custom'
+      ? ((bboxDimensionsKm(bbox)?.widthKm || 2) + (bboxDimensionsKm(bbox)?.heightKm || 2)) / 2
+      : Number(coordSizeKm);
+    // Keep coordinate text while editing; only the map extent changes here.
+    setBboxState(createSquareBbox(latValue, lonValue, size));
+  };
+
+  const handleBoundsInputChange = (field, value) => {
+    const fields = {
+      lat_min: [boundLatMin, setBoundLatMin],
+      lat_max: [boundLatMax, setBoundLatMax],
+      lon_min: [boundLonMin, setBoundLonMin],
+      lon_max: [boundLonMax, setBoundLonMax],
+    };
+    fields[field][1](value);
+    const values = {
+      lat_min: Number(field === 'lat_min' ? value : boundLatMin),
+      lat_max: Number(field === 'lat_max' ? value : boundLatMax),
+      lon_min: Number(field === 'lon_min' ? value : boundLonMin),
+      lon_max: Number(field === 'lon_max' ? value : boundLonMax),
+    };
+    const texts = {
+      lat_min: field === 'lat_min' ? value : boundLatMin,
+      lat_max: field === 'lat_max' ? value : boundLatMax,
+      lon_min: field === 'lon_min' ? value : boundLonMin,
+      lon_max: field === 'lon_max' ? value : boundLonMax,
+    };
+    if (Object.values(texts).some((text) => !text.trim()) || values.lat_min < -90 || values.lat_max > 90 || values.lon_min < -180 || values.lon_max > 180 || values.lat_min >= values.lat_max || values.lon_min >= values.lon_max) {
+      setBboxState(null);
+      return;
+    }
+    setBboxState({ lon_min: values.lon_min, lat_min: values.lat_min, lon_max: values.lon_max, lat_max: values.lat_max });
+  };
+
+  const handleCoordinateModeToggle = () => {
+    if (bbox) {
+      if (coordMode === 'center') {
+        setBoundLatMin(bbox.lat_min.toFixed(6));
+        setBoundLatMax(bbox.lat_max.toFixed(6));
+        setBoundLonMin(bbox.lon_min.toFixed(6));
+        setBoundLonMax(bbox.lon_max.toFixed(6));
+      } else {
+        setCoordLat(((bbox.lat_min + bbox.lat_max) / 2).toFixed(6));
+        setCoordLon(((bbox.lon_min + bbox.lon_max) / 2).toFixed(6));
+        const dimensions = bboxDimensionsKm(bbox);
+        const options = ['0.5', '1.0', '2.0', '5.0', '10.0'];
+        const match = options.find((size) => Math.abs(dimensions.widthKm - Number(size)) < 0.025 && Math.abs(dimensions.heightKm - Number(size)) < 0.025);
+        setCoordSizeKm(match || 'custom');
+      }
+    }
+    setCoordMode((mode) => mode === 'center' ? 'bounds' : 'center');
+  };
+
+  const handleCenterBoxSizeChange = (value) => {
+    if (value === 'custom') return;
+    setCoordSizeKm(value);
+    const lat = Number(coordLat);
+    const lon = Number(coordLon);
+    if (!coordLat.trim() || !coordLon.trim() || !Number.isFinite(lat) || !Number.isFinite(lon) || lat < -90 || lat > 90 || lon < -180 || lon > 180) {
+      setBboxState(null);
+      return;
+    }
+    setBbox(createSquareBbox(lat, lon, Number(value)));
+    setError(null);
+    setErrorCode(null);
+    setErrorMeta(null);
   };
 
   const handleApplyBoundsCoordinates = () => {
@@ -485,6 +578,26 @@ export default function App() {
   const canAnalyze = bbox && dateT1 && dateT2 && !loading;
   const bboxDimensions = bboxDimensionsKm(bbox);
   const acquisitionDiagnostics = errorMeta?.diagnostic || {};
+  const diagnosticStage = String(acquisitionDiagnostics.stage || '');
+  const isT1OrbitQueryFailure = errorCode === 'gee_api_unavailable' &&
+    /s1_t1_(?:orbit_discovery|base_count|filtered_count|orbit_histogram|orbit_metadata_parse|collection_build|filter_build)/.test(diagnosticStage);
+  const failureStageMessage = isT1OrbitQueryFailure
+    ? 'Earth Engine failed while querying Sentinel-1 metadata for T1. This is a metadata-query failure; it does not mean no orbits were found.'
+    : errorCode === 'gee_s1_no_scenes_t1' || errorCode === 'gee_s1_no_scenes_t2'
+      ? 'The Sentinel-1 query completed, but no eligible scenes matched the requested date window.'
+      : errorCode === 'gee_no_common_s1_orbit'
+        ? 'Both Sentinel-1 date-window queries completed, but they have no shared relative orbit.'
+        : errorCode === 'gee_frozen_s1_orbit_unavailable'
+          ? 'The selected extent matches a frozen research zone, but its documented relative orbit is unavailable in both date windows. The research orbit was not replaced.'
+        : errorCode === 'gee_cloud_score_no_coverage'
+          ? 'Sentinel-2 imagery was found, but Cloud Score+ quality coverage could not be used.'
+          : errorCode === 'area_too_small' || errorCode === 'gee_invalid_input_grid'
+            ? 'The selected area or downloaded grid does not meet the model’s minimum input dimensions.'
+            : errorCode === 'gee_imagery_download_failed'
+              ? 'Earth Engine found imagery, but the raster or thumbnail download failed.'
+              : errorCode === 'inference_failed'
+                ? 'Imagery passed acquisition and input validation, but Geo-Nexus model inference failed.'
+                : null;
 
   return (
     <div className="app-wrapper">
@@ -540,11 +653,11 @@ export default function App() {
         </div>
 
         {/* ── API Status ──────────────────────────────────── */}
-        <div className="navbar-status">
+        <div className="navbar-status" title={`Backend build ${backendBuildId}`}>
           <div className="status-dot" style={{
             background: apiStatus === 'error' ? 'var(--c-red)' : apiStatus === 'ok' && geeStatus === 'configured' && checkpointStatus === 'present_unverified' ? 'var(--c-green)' : 'var(--c-amber)',
           }} />
-          {apiStatus === 'error' ? 'API Offline' : apiStatus === 'checking' ? 'Connecting…' : `API Online · ${geeStatus === 'not_configured' ? 'GEE not configured' : geeStatus === 'credentials_missing' ? 'GEE credentials missing' : geeStatus === 'service_account_invalid' ? 'GEE key invalid' : geeStatus === 'configured' ? 'GEE configured · verify on run' : 'AI provider status unknown'} · ${checkpointStatus === 'missing' ? 'checkpoint missing' : checkpointStatus === 'present_unverified' ? 'checkpoint present · verify on run' : 'checking model'}`}
+          {apiStatus === 'error' ? 'API Offline' : apiStatus === 'checking' ? 'Connecting…' : `API Online · ${geeStatus === 'not_configured' ? 'GEE not configured' : geeStatus === 'credentials_missing' ? 'GEE credentials missing' : geeStatus === 'service_account_invalid' ? 'GEE key invalid' : geeStatus === 'configured' ? 'GEE configured · verify on run' : 'AI provider status unknown'} · ${checkpointStatus === 'missing' ? 'checkpoint missing' : checkpointStatus === 'present_unverified' ? 'checkpoint present · verify on run' : 'checking model'} · Build ${backendBuildId}`}
         </div>
       </nav>
 
@@ -620,7 +733,7 @@ export default function App() {
                     <span className="coord-title">🎯 Coordinate Entry</span>
                     <button
                       className="coord-mode-link"
-                      onClick={() => setCoordMode(coordMode === 'center' ? 'bounds' : 'center')}
+                      onClick={handleCoordinateModeToggle}
                     >
                       {coordMode === 'center' ? 'Switch to 4-Bounds' : 'Switch to Center+Span'}
                     </button>
@@ -637,7 +750,7 @@ export default function App() {
                             className="coord-input"
                             placeholder="18.9900"
                             value={coordLat}
-                            onChange={(e) => setCoordLat(e.target.value)}
+                            onChange={(e) => handleCenterInputChange('latitude', e.target.value)}
                           />
                         </div>
                         <div className="coord-field">
@@ -648,7 +761,7 @@ export default function App() {
                             className="coord-input"
                             placeholder="73.0700"
                             value={coordLon}
-                            onChange={(e) => setCoordLon(e.target.value)}
+                            onChange={(e) => handleCenterInputChange('longitude', e.target.value)}
                           />
                         </div>
                       </div>
@@ -658,8 +771,9 @@ export default function App() {
                         <select
                           className="coord-select"
                           value={coordSizeKm}
-                          onChange={(e) => setCoordSizeKm(e.target.value)}
+                          onChange={(e) => handleCenterBoxSizeChange(e.target.value)}
                         >
+                          {coordSizeKm === 'custom' && <option value="custom">{bboxDimensions ? `Custom · ${bboxDimensions.widthKm.toFixed(2)} km × ${bboxDimensions.heightKm.toFixed(2)} km` : 'Custom extent'}</option>}
                           <option value="0.5">500 m × 500 m (High-Detail Local)</option>
                           <option value="1.0">1 km × 1 km (Compact Site)</option>
                           <option value="2.0">2 km × 2 km (High Clarity)</option>
@@ -686,7 +800,7 @@ export default function App() {
                             className="coord-input"
                             placeholder="18.9600"
                             value={boundLatMin}
-                            onChange={(e) => setBoundLatMin(e.target.value)}
+                            onChange={(e) => handleBoundsInputChange('lat_min', e.target.value)}
                           />
                         </div>
                         <div className="coord-field">
@@ -697,7 +811,7 @@ export default function App() {
                             className="coord-input"
                             placeholder="19.0200"
                             value={boundLatMax}
-                            onChange={(e) => setBoundLatMax(e.target.value)}
+                            onChange={(e) => handleBoundsInputChange('lat_max', e.target.value)}
                           />
                         </div>
                       </div>
@@ -710,7 +824,7 @@ export default function App() {
                             className="coord-input"
                             placeholder="73.0400"
                             value={boundLonMin}
-                            onChange={(e) => setBoundLonMin(e.target.value)}
+                            onChange={(e) => handleBoundsInputChange('lon_min', e.target.value)}
                           />
                         </div>
                         <div className="coord-field">
@@ -721,7 +835,7 @@ export default function App() {
                             className="coord-input"
                             placeholder="73.1000"
                             value={boundLonMax}
-                            onChange={(e) => setBoundLonMax(e.target.value)}
+                            onChange={(e) => handleBoundsInputChange('lon_max', e.target.value)}
                           />
                         </div>
                       </div>
@@ -889,6 +1003,28 @@ export default function App() {
                   <span className="error-icon">⚠</span>
                   <span>{error}</span>
                 </div>
+                {failureStageMessage && <p role="status" style={{ margin: 0, color: 'var(--c-text2)', fontSize: '0.78rem', lineHeight: 1.5 }}>{failureStageMessage}</p>}
+                {errorMeta?.diagnostic && (
+                  <details className="acquisition-diagnostics">
+                    <summary>Acquisition diagnostics</summary>
+                    <dl>
+                      <dt>Request ID</dt><dd>{acquisitionDiagnostics.request_id || errorMeta.request_id || 'unknown'}</dd>
+                      <dt>Stage / operation</dt><dd>{diagnosticStage || 'unknown'} · {acquisitionDiagnostics.operation || 'not reported'}</dd>
+                      <dt>Exception</dt><dd>{acquisitionDiagnostics.exception_type || 'not reported'}</dd>
+                      <dt>Technical reason</dt><dd>{acquisitionDiagnostics.technical_reason || 'not reported'}</dd>
+                      <dt>Provider readiness</dt><dd>{acquisitionDiagnostics.provider_readiness || 'not reported'}</dd>
+                      <dt>T1 requested date / window</dt><dd>{acquisitionDiagnostics.requested_dates?.t1 || 'unknown'} · {acquisitionDiagnostics.search_windows?.t1?.start || 'unknown'} through {acquisitionDiagnostics.search_windows?.t1?.end_inclusive || 'unknown'}</dd>
+                      <dt>T2 requested date / window</dt><dd>{acquisitionDiagnostics.requested_dates?.t2 || 'unknown'} · {acquisitionDiagnostics.search_windows?.t2?.start || 'unknown'} through {acquisitionDiagnostics.search_windows?.t2?.end_inclusive || 'unknown'}</dd>
+                      <dt>Sentinel-1 counts T1</dt><dd>Initial: {acquisitionDiagnostics.t1_s1_count_before_filters ?? 'not obtained'} · Eligible: {acquisitionDiagnostics.t1_s1_count_after_iw_desc_vv_vh_filters ?? 'not obtained'} · Orbits: {acquisitionDiagnostics.t1_s1_orbits ? JSON.stringify(acquisitionDiagnostics.t1_s1_orbits) : 'not obtained'}</dd>
+                      <dt>Sentinel-1 counts T2</dt><dd>Initial: {acquisitionDiagnostics.t2_s1_count_before_filters ?? 'not obtained'} · Eligible: {acquisitionDiagnostics.t2_s1_count_after_iw_desc_vv_vh_filters ?? 'not obtained'} · Orbits: {acquisitionDiagnostics.t2_s1_orbits ? JSON.stringify(acquisitionDiagnostics.t2_s1_orbits) : 'not obtained'}</dd>
+                      <dt>Common / selected orbit</dt><dd>{Array.isArray(acquisitionDiagnostics.s1_common_orbits) ? acquisitionDiagnostics.s1_common_orbits.join(', ') || 'none' : 'not determined'} · selected {acquisitionDiagnostics.selected_relative_orbit ?? 'none'}</dd>
+                      {acquisitionDiagnostics.frozen_relative_orbit !== undefined && <><dt>Frozen research orbit</dt><dd>{acquisitionDiagnostics.frozen_relative_orbit}</dd></>}
+                      <dt>Was T2 Sentinel-1 queried?</dt><dd>{acquisitionDiagnostics.t2_s1_count_before_filters !== undefined ? 'Yes' : /s1_t1_/.test(diagnosticStage) ? 'No; T1 failed first' : 'Unknown'}</dd>
+                      <dt>Request bounds</dt><dd>{acquisitionDiagnostics.request_parameters?.bbox ? JSON.stringify(acquisitionDiagnostics.request_parameters.bbox) : JSON.stringify(acquisitionDiagnostics.bbox || 'not reported')}</dd>
+                      <dt>Window / cloud limit</dt><dd>{acquisitionDiagnostics.window_days ?? 'unknown'} days · {acquisitionDiagnostics.max_cloud_pct ?? 'unknown'}%</dd>
+                    </dl>
+                  </details>
+                )}
                 {['gee_not_configured', 'gee_credentials_missing', 'gee_service_account_invalid'].includes(errorCode) && (
                   <p role="status" style={{ margin: 0, color: 'var(--c-text2)', fontSize: '0.78rem', lineHeight: 1.5 }}>
                     This trained AI model needs authenticated Google Earth Engine access to real Sentinel-1 and Sentinel-2 inputs. Configure GEE before retrying; spectral analysis remains available separately.
@@ -941,7 +1077,7 @@ export default function App() {
                   <button
                     className="btn btn-ghost"
                     style={{ fontSize: '0.8rem', padding: '0.4rem 0.8rem' }}
-                    onClick={() => { setError(null); setErrorCode(null); }}
+                    onClick={() => { setError(null); setErrorCode(null); setErrorMeta(null); }}
                   >
                     ✕ Dismiss
                   </button>
@@ -1122,7 +1258,7 @@ export default function App() {
                   <span style={{ display: 'flex', gap: '.5rem', flexWrap: 'wrap' }}>
                     <button className="btn btn-primary" onClick={() => handleAnalyze({ bypassCache: true })} disabled={loading || !bbox}>Retry AI</button>
                     <button className="btn btn-spectral" onClick={() => handleSpectralAnalyze({ bypassCache: true })} disabled={loading || !bbox}>Run Spectral Analysis</button>
-                    <button className="btn btn-ghost" onClick={() => { setError(null); setErrorCode(null); }}>Dismiss</button>
+                    <button className="btn btn-ghost" onClick={() => { setError(null); setErrorCode(null); setErrorMeta(null); }}>Dismiss</button>
                   </span>
                 </div>
               )}

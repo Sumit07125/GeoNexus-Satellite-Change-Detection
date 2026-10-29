@@ -137,6 +137,19 @@ def _require_cloud_score_matches(date_label: str, linked_scene_count: int, diagn
 
 
 def _select_shared_orbit(t1_counts: dict[int, int], t2_counts: dict[int, int], frozen_orbit: int | None, diagnostic: dict):
+    common_candidates = sorted(set(t1_counts).intersection(t2_counts))
+    if frozen_orbit is not None and frozen_orbit not in common_candidates:
+        _raise_stage_error(
+            "gee_frozen_s1_orbit_unavailable",
+            f"The documented research-zone orbit {frozen_orbit} is not available in both requested date windows. The frozen research acquisition protocol was not changed.",
+            "s1_frozen_research_orbit_validation",
+            {
+                **diagnostic,
+                "s1_common_orbits": common_candidates,
+                "frozen_relative_orbit": frozen_orbit,
+                "selected_relative_orbit": None,
+            },
+        )
     orbit, common, reason = choose_shared_orbit(t1_counts, t2_counts, frozen_orbit)
     if orbit is None:
         _raise_stage_error(
@@ -152,7 +165,11 @@ def _safe_error_reason(error: Exception) -> str:
     import re
     reason = str(error)
     reason = re.sub(r"(?i)bearer\s+[^\s,;]+", "Bearer [redacted]", reason)
-    reason = re.sub(r"(?i)(token|password|secret|credential|authorization)(\s*[=:]\s*)[^\s,;]+", r"\1\2[redacted]", reason)
+    reason = re.sub(r"(?i)(access[_ ]?token|refresh[_ ]?token|private[_ ]?key|client[_ ]?secret|token|password|secret|credential|authorization)(\s*[=:]\s*)[^\s,;]+", r"\1\2[redacted]", reason)
+    reason = re.sub(r"(?i)\b(access[_ ]?token|refresh[_ ]?token|oauth token)\s+[A-Za-z0-9._~+/=-]{12,}", r"\1 [redacted]", reason)
+    reason = re.sub(r"(?i)(projects?/)([A-Za-z0-9][A-Za-z0-9-]{3,})", r"\1[redacted]", reason)
+    reason = re.sub(r"(?i)(project(?:\s+id)?\s*[=:]\s*)[A-Za-z0-9][A-Za-z0-9-]{3,}", r"\1[redacted]", reason)
+    reason = re.sub(r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b", "[service-account]", reason)
     reason = re.sub(r"(?i)https?://\S+", "[provider-url]", reason)
     reason = re.sub(r"(?i)([a-z]:\\|/)(?:[^\s:]+[\\/])+[^\s:]*", "[path]", reason)
     return reason[:240]
@@ -282,33 +299,108 @@ def _get_s1_orbit_candidates(bbox: ee.Geometry, date_str: str, window_days: int,
     target = datetime.datetime.strptime(date_str, "%Y-%m-%d")
     start = (target - datetime.timedelta(days=window_days)).strftime("%Y-%m-%d")
     end = (target + datetime.timedelta(days=window_days + 1)).strftime("%Y-%m-%d")
-
-    base = ee.ImageCollection("COPERNICUS/S1_GRD").filterBounds(bbox).filterDate(start, end)
+    label = date_label.lower()
+    request_details = {
+        **diagnostic,
+        "requested_date": date_str,
+        "search_window": {"start": start, "end_exclusive": end},
+        "filters": {
+            "collection": "COPERNICUS/S1_GRD",
+            "bounds": list(bbox) if isinstance(bbox, (list, tuple)) else "requested AOI",
+            "instrumentMode": "IW",
+            "orbitProperties_pass": "DESCENDING",
+            "transmitterReceiverPolarisation": ["VV", "VH"],
+            "relativeOrbitNumber_start": "discover from eligible scenes",
+        },
+    }
     try:
-        before_filters = int(base.size().getInfo())
+        base = ee.ImageCollection("COPERNICUS/S1_GRD").filterBounds(bbox).filterDate(start, end)
+    except Exception as error:
+        _raise_stage_error(
+            "gee_api_unavailable", "Earth Engine could not construct the initial Sentinel-1 collection.",
+            f"s1_{label}_collection_build", {**request_details, "operation": "ImageCollection/filterBounds/filterDate"}, error,
+        )
+    try:
+        before_filters = base.size().getInfo()
+        if isinstance(before_filters, bool) or not isinstance(before_filters, (int, float)) or int(before_filters) != before_filters or before_filters < 0:
+            raise ValueError("Earth Engine returned an invalid initial scene count.")
+        before_filters = int(before_filters)
+    except Exception as error:
+        _raise_stage_error(
+            "gee_api_unavailable", "Earth Engine failed while counting the initial Sentinel-1 collection.",
+            f"s1_{label}_base_count", {**request_details, "operation": "base.size().getInfo()", f"{label}_s1_count_before_filters": None}, error,
+        )
+
+    filter_details = {**request_details, f"{label}_s1_count_before_filters": before_filters}
+    try:
         eligible = (
             base.filter(ee.Filter.listContains("transmitterReceiverPolarisation", "VV"))
             .filter(ee.Filter.listContains("transmitterReceiverPolarisation", "VH"))
             .filter(ee.Filter.eq("instrumentMode", "IW"))
             .filter(ee.Filter.eq("orbitProperties_pass", "DESCENDING"))
         )
-        after_filters = int(eligible.size().getInfo())
-        histogram = eligible.aggregate_histogram("relativeOrbitNumber_start").getInfo() or {}
-        orbit_counts = {int(orbit): int(count) for orbit, count in histogram.items()}
     except Exception as error:
-        _raise_stage_error("gee_api_unavailable", f"Earth Engine could not query Sentinel-1 orbits for {date_label}.", f"s1_{date_label.lower()}_orbit_discovery", {**diagnostic, f"{date_label.lower()}_s1_count_before_filters": None, f"{date_label.lower()}_s1_count_after_iw_desc_vv_vh_filters": None, f"{date_label.lower()}_s1_orbits": {}}, error)
+        _raise_stage_error(
+            "gee_api_unavailable", "Earth Engine could not apply the Sentinel-1 acquisition filters.",
+            f"s1_{label}_filter_build", {**filter_details, "operation": "filter(VV,VH,IW,DESCENDING)"}, error,
+        )
+    try:
+        after_filters = eligible.size().getInfo()
+        if isinstance(after_filters, bool) or not isinstance(after_filters, (int, float)) or int(after_filters) != after_filters or after_filters < 0:
+            raise ValueError("Earth Engine returned an invalid eligible scene count.")
+        after_filters = int(after_filters)
+    except Exception as error:
+        _raise_stage_error(
+            "gee_api_unavailable", "Earth Engine failed while counting eligible Sentinel-1 scenes.",
+            f"s1_{label}_filtered_count", {**filter_details, "operation": "eligible.size().getInfo()", f"{label}_s1_count_after_iw_desc_vv_vh_filters": None}, error,
+        )
 
     date_diag = {
-        **diagnostic,
-        f"{date_label.lower()}_s1_count_before_filters": before_filters,
-        f"{date_label.lower()}_s1_count_after_iw_desc_vv_vh_filters": after_filters,
-        f"{date_label.lower()}_s1_orbits": orbit_counts,
+        **filter_details,
+        f"{label}_s1_count_after_iw_desc_vv_vh_filters": after_filters,
+        f"{label}_s1_orbits": None,
     }
+    if after_filters == 0:
+        _require_s1_scenes(date_label, before_filters, after_filters, {}, date_diag)
+
+    try:
+        histogram = eligible.aggregate_histogram("relativeOrbitNumber_start").getInfo()
+    except Exception as error:
+        _raise_stage_error(
+            "gee_api_unavailable", "Earth Engine failed while querying Sentinel-1 relative-orbit metadata.",
+            f"s1_{label}_orbit_histogram", {**date_diag, "operation": 'eligible.aggregate_histogram("relativeOrbitNumber_start").getInfo()'}, error,
+        )
+
+    try:
+        if not isinstance(histogram, dict):
+            raise ValueError("Orbit histogram response was not a dictionary.")
+        orbit_counts = {}
+        for raw_orbit, raw_count in histogram.items():
+            orbit = int(raw_orbit)
+            count = int(raw_count)
+            if str(orbit) != str(raw_orbit) or not 1 <= orbit <= 175:
+                raise ValueError("Orbit histogram contained an invalid relative orbit ID.")
+            if orbit in orbit_counts:
+                raise ValueError("Orbit histogram contained duplicate normalized relative orbit IDs.")
+            if isinstance(raw_count, bool) or count != raw_count or count <= 0:
+                raise ValueError("Orbit histogram contained a non-positive or non-integral scene count.")
+            orbit_counts[orbit] = count
+        if not orbit_counts:
+            raise ValueError("Orbit histogram was empty despite a non-zero eligible scene count.")
+        if sum(orbit_counts.values()) != after_filters:
+            raise ValueError("Orbit histogram scene counts did not match the eligible scene count.")
+    except Exception as error:
+        _raise_stage_error(
+            "gee_s1_orbit_metadata_invalid", "Earth Engine returned missing or malformed Sentinel-1 relative-orbit metadata.",
+            f"s1_{label}_orbit_metadata_parse", {**date_diag, "operation": "parse relativeOrbitNumber_start histogram", "s1_orbit_histogram": histogram}, error,
+        )
+
+    date_diag[f"{label}_s1_orbits"] = orbit_counts
     _require_s1_scenes(date_label, before_filters, after_filters, orbit_counts, date_diag)
     return eligible, orbit_counts, date_diag
 
 
-def _get_s1_composite(eligible_collection, relative_orbit: int):
+def _get_s1_composite(eligible_collection, relative_orbit: int, date_label: str, diagnostic: dict):
     """Composite one selected orbit in linear power, then convert to dB."""
 
     def to_natural(img):
@@ -317,18 +409,58 @@ def _get_s1_composite(eligible_collection, relative_orbit: int):
     def to_db(img):
         return img.log10().multiply(10)
 
-    col = eligible_collection.filter(ee.Filter.eq("relativeOrbitNumber_start", relative_orbit)).select(["VV", "VH"])
-    scene_count = int(col.size().getInfo())
+    label = date_label.lower()
+    try:
+        col = eligible_collection.filter(ee.Filter.eq("relativeOrbitNumber_start", relative_orbit)).select(["VV", "VH"])
+    except Exception as error:
+        _raise_stage_error(
+            "gee_api_unavailable", f"Earth Engine could not construct the selected Sentinel-1 {date_label} orbit collection.",
+            f"s1_{label}_selected_orbit_filter", {**diagnostic, "selected_relative_orbit": relative_orbit, "operation": "filter(relativeOrbitNumber_start).select(VV,VH)"}, error,
+        )
+    try:
+        scene_count = col.size().getInfo()
+        if isinstance(scene_count, bool) or not isinstance(scene_count, (int, float)) or int(scene_count) != scene_count or scene_count < 0:
+            raise ValueError("Earth Engine returned an invalid selected-orbit scene count.")
+        scene_count = int(scene_count)
+    except Exception as error:
+        _raise_stage_error(
+            "gee_api_unavailable", f"Earth Engine failed while counting selected-orbit Sentinel-1 scenes for {date_label}.",
+            f"s1_{label}_selected_orbit_count", {**diagnostic, "selected_relative_orbit": relative_orbit, "operation": "selected_orbit.size().getInfo()"}, error,
+        )
     if scene_count == 0:
-        raise RuntimeError(f"Selected Sentinel-1 relative orbit {relative_orbit} unexpectedly has no scenes.")
+        _raise_stage_error(
+            "gee_s1_orbit_scene_count_inconsistent", f"The selected Sentinel-1 orbit {relative_orbit} disappeared before {date_label} composite creation.",
+            f"s1_{label}_selected_orbit_count", {**diagnostic, "selected_relative_orbit": relative_orbit, "selected_orbit_scene_count": 0},
+        )
 
-    composite = to_db(col.map(to_natural).median())
-    vv = composite.select("VV")
-    vh = composite.select("VH")
-    vhvv = vh.subtract(vv).rename("VH_VV")
+    try:
+        composite = to_db(col.map(to_natural).median())
+        vv = composite.select("VV")
+        vh = composite.select("VH")
+        vhvv = vh.subtract(vv).rename("VH_VV")
+        composite = composite.addBands(vhvv)
+    except Exception as error:
+        _raise_stage_error(
+            "gee_api_unavailable", f"Earth Engine could not construct the selected Sentinel-1 {date_label} composite.",
+            f"s1_{label}_composite_build", {**diagnostic, "selected_relative_orbit": relative_orbit, "selected_orbit_scene_count": scene_count, "operation": "linear_power_median_to_db_and_VH_VV"}, error,
+        )
 
-    scenes = _scene_metadata(col)
-    return composite.addBands(vhvv), scene_count, scenes
+    try:
+        scenes = _scene_metadata(col)
+    except Exception as error:
+        _raise_stage_error(
+            "gee_api_unavailable", f"Earth Engine could not read selected Sentinel-1 acquisition metadata for {date_label}.",
+            f"s1_{label}_selected_scene_metadata", {**diagnostic, "selected_relative_orbit": relative_orbit, "selected_orbit_scene_count": scene_count, "operation": "selected_scene.reduceColumns(system:index,system:time_start).getInfo()"}, error,
+        )
+    return composite, scene_count, scenes
+
+
+def _get_s1_pair_composites(t1_candidates, t2_candidates, relative_orbit: int, diagnostic: dict):
+    """Build both dates with the same selected relative orbit."""
+    return (
+        _get_s1_composite(t1_candidates, relative_orbit, "T1", diagnostic),
+        _get_s1_composite(t2_candidates, relative_orbit, "T2", diagnostic),
+    )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -398,9 +530,15 @@ def fetch_imagery(
     thumb_dim = f"{out_w}x{out_h}"
 
     s2_t1, t1_count, t1_s2_scenes, t1_s2_diag = _get_s2_composite(bbox, date_t1, window_days, max_cloud, "T1", diagnostic)
-    s2_t2, t2_count, t2_s2_scenes, t2_s2_diag = _get_s2_composite(bbox, date_t2, window_days, max_cloud, "T2", diagnostic)
-    s1_t1_candidates, t1_orbits, t1_s1_diag = _get_s1_orbit_candidates(bbox, date_t1, window_days, "T1", diagnostic)
-    s1_t2_candidates, t2_orbits, t2_s1_diag = _get_s1_orbit_candidates(bbox, date_t2, window_days, "T2", diagnostic)
+    s2_t2, t2_count, t2_s2_scenes, t2_s2_diag = _get_s2_composite(
+        bbox, date_t2, window_days, max_cloud, "T2", {**diagnostic, **t1_s2_diag}
+    )
+    s1_t1_candidates, t1_orbits, t1_s1_diag = _get_s1_orbit_candidates(
+        bbox, date_t1, window_days, "T1", {**diagnostic, **t1_s2_diag, **t2_s2_diag}
+    )
+    s1_t2_candidates, t2_orbits, t2_s1_diag = _get_s1_orbit_candidates(
+        bbox, date_t2, window_days, "T2", {**diagnostic, **t1_s1_diag}
+    )
 
     research_zone = _matches_research_zone(coords)
     frozen_orbit = research_zone[1] if research_zone else None
@@ -415,9 +553,12 @@ def fetch_imagery(
         "selected_relative_orbit": relative_orbit,
     }
     try:
-        s1_t1, t1_s1_count, t1_s1_scenes = _get_s1_composite(s1_t1_candidates, relative_orbit)
-        s1_t2, t2_s1_count, t2_s1_scenes = _get_s1_composite(s1_t2_candidates, relative_orbit)
+        t1_s1_result, t2_s1_result = _get_s1_pair_composites(s1_t1_candidates, s1_t2_candidates, relative_orbit, orbit_diagnostic)
+        s1_t1, t1_s1_count, t1_s1_scenes = t1_s1_result
+        s1_t2, t2_s1_count, t2_s1_scenes = t2_s1_result
     except Exception as error:
+        if isinstance(error, GEEAcquisitionError):
+            raise
         _raise_stage_error("gee_api_unavailable", "Earth Engine could not construct the selected common Sentinel-1 orbit composites.", "s1_composite", orbit_diagnostic, error)
 
     acquisition_diagnostics = {

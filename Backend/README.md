@@ -6,6 +6,8 @@ Flask-based asynchronous API server providing dual-engine satellite change detec
 
 The AI endpoint requires genuine Sentinel-1 VV/VH/VH_VV and the trained Q quality feature. Google Earth Engine constructs these inputs on the documented 10 m UTM grid. The runtime accepts areas at least 128×128 pixels (about 1.3 km per side) and caps a single download at 400,000 pixels. The public STAC provider supplies Sentinel-2 only and is used by the explicit spectral endpoint. The AI endpoint never falls back to STAC: it returns a structured readiness, authentication, project-access, acquisition, or input-validation error when GEE cannot provide the trained multimodal inputs. STAC's constant SAR/Q placeholders are never passed to the model.
 
+The AI model consumes 17 channels in manifest order: B2–B12, NDVI, NDBI, VV, VH, VH_VV, and Q. The existing production checkpoint, strict loader, train-only normalization, 128×128 patch size, Q encoding `clip(n_clear / 8, 0, 1)`, and model threshold remain unchanged. A successful Earth Engine initialization or `ee.Number(1).getInfo()` confirms the authenticated client can make a basic request; it does not confirm that the Sentinel-1 collection, filters, orbit metadata, Cloud Score+, requested scenes, or raster download will work for a particular AOI and time window.
+
 For the production multi-date composite path, training defines `Q = clip(n_clear / 8, 0, 1)`, where `n_clear` counts B4 observations after linked Cloud Score+ `cs_cdf >= 0.60` masking. The training heterogeneity gate applies to raw `n_clear` (`std(n_clear) > 0.5`) before Q clipping, so a constant Q raster can be valid when the raw count varied above the clipping ceiling. GEE records raw count statistics; runtime checks source provenance, finite values, encoded range and all-zero/low-coverage nodata before applying the criterion to raw counts. Missing raw diagnostics or failed heterogeneity returns provider/date/channel details; no variation is fabricated. The single-date monsoon benchmark uses `cs_cdf` directly, but the runtime does not currently acquire that product.
 
 ## Architecture
@@ -50,6 +52,7 @@ cp .env.example .env
 Edit `.env` to configure your settings:
 - `GEE_PROJECT_ID`: Required for AI. Replace `your-gcp-project-id` with a real Google Cloud project that has the Earth Engine API enabled. Missing, blank, and placeholder values are rejected; spectral analysis remains usable.
 - Authentication: run `earthengine authenticate` for local user credentials, or set `GEE_SERVICE_ACCOUNT_KEY` to a valid service-account JSON file whose account has Earth Engine access to the configured project. Secret contents are never returned by health checks.
+- `GEONEXUS_BUILD_ID`: Optional, non-secret deploy label. If omitted, the backend reports the current short Git revision when Git metadata is present, with `-dirty` appended if the worktree has edits; it reports `unknown` otherwise. The same identifier appears in startup logs and `/api/health`.
 - `FRONTEND_URL`: `http://localhost:5173`
 - `FLASK_PORT`: `5000`
 - `CORS_ORIGINS`: comma-separated browser origins; defaults to `FRONTEND_URL`.
@@ -79,7 +82,9 @@ Both start endpoints validate bbox coordinates, ordered ISO dates, cloud percent
 
 ### Sentinel-1 orbit and area policy
 
-For the exact Pune, Satara, and Vidarbha research benchmark extents, the documented frozen relative orbits (136, 136, and 165) remain in force. Other AOIs query `COPERNICUS/S1_GRD` independently in each requested date window, retain descending IW scenes with VV and VH, and choose a single shared relative orbit. The selection is deterministic: maximize the lower of the T1/T2 scene counts, then total count, then prefer the lower orbit ID. If there is no common orbit, the AI job returns `gee_no_common_s1_orbit` with per-date orbit counts; it does not alter the requested window. Users may explicitly widen the temporal search window and retry.
+For the exact Pune, Satara, and Vidarbha research benchmark extents, the documented frozen relative orbits (136, 136, and 165) remain in force. If a frozen orbit is missing from either period, the AI job reports `gee_frozen_s1_orbit_unavailable` and does not substitute another orbit. Other AOIs query `COPERNICUS/S1_GRD` independently in each requested date window, retain descending IW scenes with VV and VH, and choose a single shared relative orbit. The selection is deterministic: maximize the lower of the T1/T2 scene counts, then total count, then prefer the lower orbit ID. If both successful queries have no common orbit, the AI job returns `gee_no_common_s1_orbit` with per-date orbit counts; it does not alter the requested window. Users may explicitly widen the temporal search window and retry.
+
+Remote S1 work is recorded separately for collection construction, initial count, filter construction, eligible count, histogram evaluation, and histogram parsing. A failed remote operation remains `gee_api_unavailable` (or the classified authentication/project-access code) with the exact T1/T2 stage and sanitized provider reason. Zero eligible scenes and malformed orbit metadata are separate outcomes; `gee_no_common_s1_orbit` is only returned after both date-window queries succeed with candidate sets that do not intersect. Histogram parsing checks that IDs and positive counts are valid and that the histogram total matches the eligible collection count. The implementation retains `aggregate_histogram`; the read-only diagnostic probes `aggregate_array` only after a histogram error and does not silently change production behavior.
 
 AI requests smaller than 1.28 km in either bbox dimension are rejected before a satellite job is queued. The downloaded T1/T2 grids are checked again for matching shapes and at least 128×128 pixels. Acquisition failures preserve a stage code and bounded diagnostics, including requested dates/windows, scene and orbit counts, Cloud Score+ matches, selected scene metadata, CRS/grid information when available, and a sanitized technical reason. The public job response omits stack traces and credentials. A successful local authentication check establishes account access only; it does not prove that the selected date windows contain suitable Sentinel-1/Sentinel-2 imagery. The deterministic test suite uses mocks and does not establish live imagery availability.
 
@@ -94,4 +99,14 @@ python -m unittest discover -s tests -p test_reliability_contracts.py -v
 The older `test_verify_*.py` and overlay scripts are scratch-data diagnostics. They require `scratch_t1.png`, `scratch_t2.png`, and/or `scratch_tensors.npz` in `Backend/`; those fixtures are not committed. `test_gee_full_pipeline.py` queries the live public STAC service and needs network access.
 
 The deterministic suite tests Q range/nodata/heterogeneity cases and provider separation with local arrays and mocked services. It does not validate live GEE credentials or current imagery availability. See [diagnostics/README.md](diagnostics/README.md) for the optional operational diagnostic and its access/configuration requirements.
+
+To isolate the production Sentinel-1 metadata operations from raster download and inference, run this read-only diagnostic from `Backend/` in the same configured Python environment as Flask:
+
+```powershell
+python diagnostics/test_s1_orbit_query.py --t1 2021-03-15 --t2 2024-03-15 --window-days 15 --max-cloud 30 --bbox 72.8432 19.1113 72.8527 19.1203
+```
+
+It uses `Backend/.env` by default (an optional `--project` overrides the project without printing it), checks initialization and a trivial EE request, then reports each date window's initial count, eligible count, orbit histogram, and common orbits. For these dates, the inclusive windows are 2021-02-28 through 2021-03-30 and 2024-02-29 through 2024-03-30; EE uses 2021-03-31 and 2024-03-31 as exclusive ends. If histogram evaluation fails after counts succeed, it probes `aggregate_array` for diagnosis only.
+
+Recovery: `gee_api_unavailable` means a metadata/API operation failed and is not evidence of an empty orbit set. Use its stage and technical reason to fix authentication, project access, or that operation. `gee_s1_no_scenes_t1/t2` means the corresponding successful query found no eligible scene. `gee_no_common_s1_orbit` means both successful queries returned disjoint orbit IDs; explicitly widen the window or pick other dates. Cloud Score+ errors need matching quality coverage. `area_too_small` requires enlarging the real bbox to at least 1.28 km on both axes; imagery is never upscaled to pretend it has 10 m pixels.
 

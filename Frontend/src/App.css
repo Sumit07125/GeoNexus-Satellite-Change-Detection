@@ -188,6 +188,12 @@
 .advanced-analysis summary { cursor: pointer; color: var(--c-teal); font-size: .82rem; font-weight: 650; }
 .advanced-analysis summary:focus-visible { outline: 2px solid var(--c-teal); outline-offset: 3px; border-radius: 3px; }
 .advanced-analysis p { color: var(--c-text2); font-size: .76rem; line-height: 1.55; margin: .65rem 0; }
+.acquisition-diagnostics { width: 100%; border: 1px solid var(--c-border); border-radius: var(--radius); padding: .65rem .75rem; background: rgba(8, 15, 27, .62); color: var(--c-text2); font-size: .73rem; }
+.acquisition-diagnostics summary { cursor: pointer; color: var(--c-teal); font-weight: 650; }
+.acquisition-diagnostics summary:focus-visible { outline: 2px solid var(--c-teal); outline-offset: 3px; border-radius: 3px; }
+.acquisition-diagnostics dl { display: grid; grid-template-columns: minmax(8rem, .7fr) minmax(0, 1.3fr); gap: .35rem .6rem; margin: .65rem 0 0; }
+.acquisition-diagnostics dt { color: var(--c-text3); }
+.acquisition-diagnostics dd { margin: 0; overflow-wrap: anywhere; color: var(--c-text2); }
 .engine-source-badge { display: inline-flex; align-items: center; border-radius: 999px; padding: .34rem .66rem; font-size: .72rem; font-weight: 700; letter-spacing: .01em; border: 1px solid currentColor; }
 .engine-source-badge.ai { color: #7dd3fc; background: rgba(14, 116, 144, .14); }
 .engine-source-badge.spectral { color: #86efac; background: rgba(22, 101, 52, .16); }
@@ -205,4 +211,6 @@
   .results-title-group { flex-wrap: wrap; }
   .engine-source-badge { max-width: 100%; white-space: normal; }
   .advanced-analysis { padding: .7rem; }
+  .acquisition-diagnostics dl { grid-template-columns: 1fr; gap: .2rem; }
+  .acquisition-diagnostics dd { margin-bottom: .35rem; }
 }

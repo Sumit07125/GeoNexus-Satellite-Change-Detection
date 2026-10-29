@@ -13,16 +13,42 @@ import traceback
 import math
 import re
 import json
+import subprocess
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 from dotenv import load_dotenv
 
 load_dotenv(override=True)
 
+
+def _application_build_id():
+    configured = os.environ.get("GEONEXUS_BUILD_ID", "").strip()
+    if configured:
+        return re.sub(r"[^A-Za-z0-9._-]", "", configured)[:80] or "unknown"
+    try:
+        completed = subprocess.run(
+            ["git", "rev-parse", "--short", "HEAD"],
+            cwd=os.path.dirname(os.path.abspath(__file__)),
+            capture_output=True, text=True, timeout=1, check=True,
+        )
+        revision = completed.stdout.strip()[:40] or "unknown"
+        state = subprocess.run(
+            ["git", "status", "--porcelain", "--untracked-files=normal"],
+            cwd=os.path.dirname(os.path.abspath(__file__)),
+            capture_output=True, text=True, timeout=1, check=True,
+        )
+        return f"{revision}-dirty" if state.stdout.strip() else revision
+    except Exception:
+        return "unknown"
+
+
+BUILD_ID = _application_build_id()
+
 from gee_config import get_gee_configuration
 
 _startup_gee = get_gee_configuration()
 print(f"[ENV] Google Earth Engine readiness: {_startup_gee['status']}")
+print(f"[BOOT] Geo-Nexus build: {BUILD_ID}")
 
 app = Flask(__name__)
 
@@ -366,6 +392,18 @@ def _run_job(job_id: str, payload: dict):
             else:
                 code, message = classify_gee_error(gee_err)
             diagnostic = getattr(gee_err, "details", {}) or {}
+            diagnostic = {
+                **diagnostic,
+                "request_id": job_id,
+                "provider_readiness": get_gee_configuration().get("status", "unknown"),
+                "request_parameters": {
+                    "bbox": bbox,
+                    "date_t1": date_t1,
+                    "date_t2": date_t2,
+                    "window_days": window_days,
+                    "max_cloud_pct": max_cloud,
+                },
+            }
             attempt = {
                 "provider": "Google Earth Engine", "status": code,
                 "stage": diagnostic.get("stage", "acquisition"),
@@ -374,9 +412,15 @@ def _run_job(job_id: str, payload: dict):
             provider_attempts.append(attempt)
             meta["provider_attempts"] = provider_attempts
             app.logger.error("gee_acquisition_failure=%s", json.dumps({
-                "job_id": job_id, **attempt, "diagnostics": diagnostic,
+                "job_id": job_id, "request_id": job_id, **attempt, "diagnostics": diagnostic,
             }, separators=(",", ":")))
-            details = diagnostic or {"provider": "Google Earth Engine", "requested_dates": {"t1": date_t1, "t2": date_t2}, "window_days": window_days, "max_cloud_pct": max_cloud}
+            details = diagnostic or {
+                "provider": "Google Earth Engine",
+                "requested_dates": {"t1": date_t1, "t2": date_t2},
+                "window_days": window_days,
+                "max_cloud_pct": max_cloud,
+            }
+            details.setdefault("requested_dates", {"t1": date_t1, "t2": date_t2})
             raise PipelineError(code, message, details) from gee_err
 
         meta["provider_attempts"] = provider_attempts
@@ -637,6 +681,7 @@ def health():
         "status": "ok",
         "service": "Geo-Nexus Change Detection API",
         "version": "3.2.0",
+        "build_id": BUILD_ID,
         "model": os.environ.get("MODEL_CHECKPOINT", "mh_fewshot_best_k30.pth"),
         "model_checkpoint_available": checkpoint_available,
         "ai_readiness": {
@@ -716,6 +761,7 @@ def detect_status(job_id: str):
     resp = {
         "success": True,
         "job_id":  job_id,
+        "request_id": job_id,
         "status":  job["status"],    # pending | running | done | error
         "progress": job["progress"],
         "engine": job.get("engine", "unknown"),

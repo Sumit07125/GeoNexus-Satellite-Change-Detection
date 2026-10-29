@@ -8,6 +8,8 @@ test('2 km center-box control produces a real approximately 2 km by 2 km extent 
   assert.ok(Math.abs(dimensions.widthKm - 2) < 0.01);
   assert.ok(Math.abs(dimensions.heightKm - 2) < 0.01);
   assert.ok(Math.abs((bbox.lat_max - bbox.lat_min) - 0.018) < 0.001);
+  assert.ok(Math.abs((bbox.lon_min + bbox.lon_max) / 2 - 72.84795) < 1e-10);
+  assert.ok(Math.abs((bbox.lat_min + bbox.lat_max) / 2 - 19.1158) < 1e-10);
 });
 
 test('the reported screenshot bounds measure about 1 km and are below AI grid minimum', () => {

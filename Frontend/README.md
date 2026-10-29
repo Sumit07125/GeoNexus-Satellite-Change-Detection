@@ -45,6 +45,19 @@ VITE_API_URL=http://localhost:5000
 
 AI inference requires a configured and authenticated Google Earth Engine project for real Sentinel-1 inputs. The backend reports configuration, authentication, access, acquisition, and input-validation failures without falling back to Sentinel-2-only STAC. The explicitly selected spectral method can use STAC imagery and is always labeled as spectral analysis. Backend health distinguishes API availability from AI provider readiness; remote Earth Engine access and strict checkpoint loading are confirmed during a run.
 
+The status line includes the backend build ID reported by `GET /api/health`, which helps identify a stale backend process. When Sentinel-1 acquisition fails, the error panel distinguishes a query failure from no eligible scenes or no shared orbit and provides an expandable, sanitized acquisition report. A query failure does not imply that no orbit exists. Retry AI repeats the AI request; Run Spectral Analysis calls its separate endpoint.
+
+Center-and-size coordinate controls recalculate the map selection as the size or center is edited. The selected bbox, displayed dimensions, and submitted request use the same bounds. The backend rejects AI areas smaller than 1.28 km in either dimension; the recovery button expands around the current bbox center to a 1.4 km square. The spectral engine remains available for smaller regions.
+
+Frontend validation commands from `Frontend/`:
+
+```powershell
+npm ci
+npm run test
+npm run lint
+npm run build
+```
+
 ### 4. Development Server
 
 ```bash

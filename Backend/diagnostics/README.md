@@ -36,3 +36,13 @@ python diagnostics/region_pair_diagnostic.py --config diagnostics/private_config
 ```
 
 The JSON report records all generated inputs, provider/acquisition metadata, validation/acquisition failures, timing, model/preprocessing version, threshold provenance, and separate AI/S-CVA output paths. The same seed and config reproduce generated regions and date pairs. A failed acquisition remains a failed row; the CLI does not replace it to force 30 successes. Result files are operational diagnostics only and have no ground-truth accuracy interpretation.
+
+## Isolated Sentinel-1 orbit metadata query
+
+To identify which read-only Earth Engine metadata operation fails, run from `Backend/` using the same Python environment and `.env` as Flask:
+
+```powershell
+python diagnostics/test_s1_orbit_query.py --t1 2021-03-15 --t2 2024-03-15 --window-days 15 --max-cloud 30 --bbox 72.8432 19.1113 72.8527 19.1203
+```
+
+This probe initializes EE, makes one trivial request, then runs base collection count, descending IW VV/VH filtered count, orbit histogram, and response parsing independently for T1 and T2. It prints inclusive and exclusive date bounds, computes the common orbit set only when both queries succeed, and never downloads imagery or runs inference. If histogram evaluation fails, it tries `aggregate_array` as a diagnostic probe only; production still uses the histogram query. Project credentials are read locally and never printed.

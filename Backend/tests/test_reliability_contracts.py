@@ -37,6 +37,7 @@ class ReliabilityContractTests(unittest.TestCase):
         self.assertEqual(response.json["engines"], ["geonexus_ai", "spectral_scva"])
         self.assertIn("ai_readiness", response.json)
         self.assertFalse(response.json["ai_readiness"]["ready"])
+        self.assertRegex(response.json["build_id"], r"^[A-Za-z0-9._-]+$")
 
     def test_gee_configuration_rejects_missing_and_case_insensitive_placeholders(self):
         for project in (None, "", "  YOUR-GCP-PROJECT-ID  ", "Not Set", "your_gee_project_id"):
@@ -68,6 +69,114 @@ class ReliabilityContractTests(unittest.TestCase):
         self.assertIn("lowest orbit ID", policy)
         self.assertEqual(gee_service.choose_shared_orbit(t1, t2)[0], gee_service.choose_shared_orbit(t1, t2)[0])
 
+    def _mock_s1_candidate_query(self, *, base_count=4, eligible_count=2, histogram=None, fail_at=None, failure=None):
+        class Info:
+            def __init__(self, value=None, error=None):
+                self.value, self.error = value, error
+            def getInfo(self):
+                if self.error:
+                    raise self.error
+                return self.value
+
+        class Collection:
+            def __init__(self, filters=0):
+                self.filter_count = filters
+            def filterBounds(self, _bbox): return Collection(self.filter_count)
+            def filterDate(self, _start, _end): return Collection(self.filter_count)
+            def filter(self, _filter): return Collection(self.filter_count + 1)
+            def size(self):
+                operation = "base_count" if self.filter_count == 0 else "filtered_count"
+                value = base_count if operation == "base_count" else eligible_count
+                return Info(value, failure if fail_at == operation else None)
+            def aggregate_histogram(self, _property):
+                return Info(histogram, failure if fail_at == "histogram" else None)
+
+        collection = Collection()
+        with patch.object(gee_service.ee, "ImageCollection", return_value=collection), \
+             patch.object(gee_service.ee.Filter, "listContains", side_effect=lambda *args, **kwargs: ("contains", args, kwargs)), \
+             patch.object(gee_service.ee.Filter, "eq", side_effect=lambda *args, **kwargs: ("equals", args, kwargs)):
+            return gee_service._get_s1_orbit_candidates(
+                object(), "2021-03-15", 15, "T1",
+                gee_service._diagnostic_base("2021-03-15", "2024-03-15", 15, 30, (72.84, 19.11, 72.86, 19.13)),
+            )
+
+    def test_s1_base_count_failure_has_exact_stage_and_operation(self):
+        with self.assertRaises(gee_service.GEEAcquisitionError) as caught:
+            self._mock_s1_candidate_query(fail_at="base_count", failure=RuntimeError("temporarily unavailable"))
+        self.assertEqual(caught.exception.code, "gee_api_unavailable")
+        self.assertEqual(caught.exception.details["stage"], "s1_t1_base_count")
+        self.assertEqual(caught.exception.details["operation"], "base.size().getInfo()")
+
+    def test_s1_filtered_count_failure_retains_base_count(self):
+        with self.assertRaises(gee_service.GEEAcquisitionError) as caught:
+            self._mock_s1_candidate_query(fail_at="filtered_count", failure=RuntimeError("evaluation failed"))
+        self.assertEqual(caught.exception.details["stage"], "s1_t1_filtered_count")
+        self.assertEqual(caught.exception.details["t1_s1_count_before_filters"], 4)
+        self.assertEqual(caught.exception.details["operation"], "eligible.size().getInfo()")
+
+    def test_s1_histogram_failure_retains_both_collection_counts(self):
+        with self.assertRaises(gee_service.GEEAcquisitionError) as caught:
+            self._mock_s1_candidate_query(fail_at="histogram", failure=RuntimeError("histogram unavailable"))
+        self.assertEqual(caught.exception.details["stage"], "s1_t1_orbit_histogram")
+        self.assertEqual(caught.exception.details["t1_s1_count_before_filters"], 4)
+        self.assertEqual(caught.exception.details["t1_s1_count_after_iw_desc_vv_vh_filters"], 2)
+        self.assertIn("aggregate_histogram", caught.exception.details["operation"])
+
+    def test_s1_histogram_metadata_parse_failure_is_distinct_from_query_failure(self):
+        with self.assertRaises(gee_service.GEEAcquisitionError) as caught:
+            self._mock_s1_candidate_query(histogram={"bad-orbit": 2})
+        self.assertEqual(caught.exception.code, "gee_s1_orbit_metadata_invalid")
+        self.assertEqual(caught.exception.details["stage"], "s1_t1_orbit_metadata_parse")
+        self.assertEqual(caught.exception.details["s1_orbit_histogram"], {"bad-orbit": 2})
+
+    def test_empty_s1_collection_and_empty_histogram_have_distinct_meanings(self):
+        with self.assertRaises(gee_service.GEEAcquisitionError) as empty_collection:
+            self._mock_s1_candidate_query(base_count=0, eligible_count=0, histogram=None)
+        self.assertEqual(empty_collection.exception.code, "gee_s1_no_scenes_t1")
+        self.assertEqual(empty_collection.exception.details["t1_s1_count_before_filters"], 0)
+        with self.assertRaises(gee_service.GEEAcquisitionError) as no_eligible:
+            self._mock_s1_candidate_query(base_count=4, eligible_count=0, histogram=None)
+        self.assertEqual(no_eligible.exception.code, "gee_s1_no_scenes_t1")
+        self.assertEqual(no_eligible.exception.details["t1_s1_count_after_iw_desc_vv_vh_filters"], 0)
+        with self.assertRaises(gee_service.GEEAcquisitionError) as empty_histogram:
+            self._mock_s1_candidate_query(base_count=4, eligible_count=2, histogram={})
+        self.assertEqual(empty_histogram.exception.code, "gee_s1_orbit_metadata_invalid")
+        self.assertEqual(empty_histogram.exception.details["stage"], "s1_t1_orbit_metadata_parse")
+
+    def test_s1_t1_and_t2_query_failure_stages_are_not_confused(self):
+        for label, target in (("T1", "2021-03-15"), ("T2", "2024-03-15")):
+            with self.subTest(label=label):
+                with patch.object(gee_service.ee, "ImageCollection", side_effect=RuntimeError("permission denied")):
+                    with self.assertRaises(gee_service.GEEAcquisitionError) as caught:
+                        gee_service._get_s1_orbit_candidates(object(), target, 15, label, {})
+                self.assertEqual(caught.exception.code, "gee_project_access_denied")
+                self.assertEqual(caught.exception.details["stage"], f"s1_{label.lower()}_collection_build")
+
+    def test_s1_authentication_failure_is_not_misreported_as_missing_scenes(self):
+        with patch.object(gee_service.ee, "ImageCollection", side_effect=RuntimeError("invalid_grant authorization=supersecret")):
+            with self.assertRaises(gee_service.GEEAcquisitionError) as caught:
+                gee_service._get_s1_orbit_candidates(object(), "2021-03-15", 15, "T1", {})
+        self.assertEqual(caught.exception.code, "gee_authentication_failed")
+        self.assertEqual(caught.exception.details["stage"], "s1_t1_collection_build")
+        self.assertNotIn("supersecret", caught.exception.details["technical_reason"])
+
+    def test_s1_project_access_failure_does_not_expose_project_id(self):
+        with patch.object(gee_service.ee, "ImageCollection", side_effect=RuntimeError("403 permission denied for projects/private-cloud-project")):
+            with self.assertRaises(gee_service.GEEAcquisitionError) as caught:
+                gee_service._get_s1_orbit_candidates(object(), "2021-03-15", 15, "T1", {})
+        self.assertEqual(caught.exception.code, "gee_project_access_denied")
+        self.assertNotIn("private-cloud-project", caught.exception.details["technical_reason"])
+
+    def test_successful_s1_orbit_queries_share_one_orbit_for_both_composites(self):
+        t1_counts = {136: 3, 37: 4}
+        t2_counts = {37: 2, 165: 6}
+        orbit, common, _ = gee_service.choose_shared_orbit(t1_counts, t2_counts)
+        self.assertEqual((orbit, common), (37, [37]))
+        with patch.object(gee_service, "_get_s1_composite", side_effect=["T1", "T2"]) as build:
+            result = gee_service._get_s1_pair_composites("t1 candidates", "t2 candidates", orbit, {"stage": "s1_common_orbit_selection"})
+        self.assertEqual(result, ("T1", "T2"))
+        self.assertEqual([call.args[1] for call in build.call_args_list], [37, 37])
+
     def test_orbit_seen_in_only_one_window_is_rejected_with_candidate_counts(self):
         t1 = {136: 6}
         t2 = {165: 4}
@@ -76,6 +185,13 @@ class ReliabilityContractTests(unittest.TestCase):
         self.assertEqual(caught.exception.code, "gee_no_common_s1_orbit")
         self.assertEqual(caught.exception.details["s1_common_orbits"], [])
         self.assertIn("t1_s1_orbits", caught.exception.details)
+
+    def test_frozen_research_orbit_unavailable_is_not_mislabeled_as_no_common_orbit(self):
+        with self.assertRaises(gee_service.GEEAcquisitionError) as caught:
+            gee_service._select_shared_orbit({136: 2, 37: 4}, {37: 5}, 136, {"research_zone": "zone_a_pune"})
+        self.assertEqual(caught.exception.code, "gee_frozen_s1_orbit_unavailable")
+        self.assertEqual(caught.exception.details["s1_common_orbits"], [37])
+        self.assertEqual(caught.exception.details["frozen_relative_orbit"], 136)
 
     def test_arbitrary_mumbai_box_uses_discovered_orbits_and_exact_research_zone_keeps_lock(self):
         mumbai = (72.8432, 19.1113, 72.8527, 19.1203)
@@ -108,6 +224,23 @@ class ReliabilityContractTests(unittest.TestCase):
         self.assertEqual(response.json["error_code"], "area_too_small")
         self.assertLess(response.json["meta"]["estimated_bbox_dimensions_m"]["width"], 1280)
         thread.assert_not_called()
+
+    def test_two_km_mumbai_bbox_is_validated_and_the_same_bbox_is_queued(self):
+        from math import cos, radians
+        center_lat, center_lon, size_km = 19.1158, 72.84795, 2.0
+        half_lat = (size_km / 2) / 111.13
+        half_lon = (size_km / 2) / (111.32 * cos(radians(center_lat)))
+        bbox = {"lon_min": center_lon-half_lon, "lat_min": center_lat-half_lat, "lon_max": center_lon+half_lon, "lat_max": center_lat+half_lat}
+        body = {"bbox": bbox, "date_t1": "2021-03-15", "date_t2": "2024-03-15"}
+        readiness = {"status": "configured", "configured": True, "auth_method": "local_credentials"}
+        with patch("app.get_gee_configuration", return_value=readiness), patch("app.threading.Thread") as thread:
+            response = self.client.post("/api/detect/start", json=body)
+        self.assertEqual(response.status_code, 200)
+        queued_payload = thread.call_args.kwargs["args"][1]
+        self.assertEqual(queued_payload["bbox"], bbox)
+        dimensions = api._bbox_dimensions_m(queued_payload["bbox"])
+        self.assertAlmostEqual(dimensions["width"] / 1000, 2, delta=0.02)
+        self.assertAlmostEqual(dimensions["height"] / 1000, 2, delta=0.02)
 
     def test_gee_init_uses_configured_credentials_and_classifies_auth_failure(self):
         config = {"configured": True, "auth_method": "local_credentials"}
@@ -398,6 +531,36 @@ class ReliabilityContractTests(unittest.TestCase):
         self.assertEqual(api._jobs["stac-ai"]["error_code"], "gee_project_access_denied")
         self.assertEqual(api._jobs["stac-ai"]["meta"]["provider_attempts"][0]["provider"], "Google Earth Engine")
         self.assertEqual(api._jobs["stac-ai"]["meta"]["diagnostic"]["requested_dates"]["t1"], "2021-01-01")
+
+    def test_s1_orbit_query_diagnostics_survive_job_polling(self):
+        error = gee_service.GEEAcquisitionError(
+            "gee_api_unavailable", "Earth Engine could not query Sentinel-1 orbits for T1.",
+            {
+                "provider": "Google Earth Engine", "stage": "s1_t1_orbit_histogram",
+                "operation": 'eligible.aggregate_histogram("relativeOrbitNumber_start").getInfo()',
+                "requested_dates": {"t1": "2021-03-15", "t2": "2024-03-15"},
+                "search_windows": {"t1": {"start": "2021-02-28", "end_inclusive": "2021-03-30"}, "t2": {"start": "2024-02-29", "end_inclusive": "2024-03-30"}},
+                "t1_s1_count_before_filters": 9, "t1_s1_count_after_iw_desc_vv_vh_filters": 4,
+                "exception_type": "EEException", "technical_reason": "query failed safely",
+            },
+        )
+        gee = types.ModuleType("gee_service")
+        gee.fetch_imagery = lambda **kwargs: (_ for _ in ()).throw(error)
+        model = types.ModuleType("inference")
+        model.run_inference = lambda **kwargs: self.fail("model must not run after query failure")
+        readiness = {"status": "configured", "configured": True, "auth_method": "local_credentials"}
+        with patch("app.get_gee_configuration", return_value=readiness), patch.dict(sys.modules, {"gee_service": gee, "inference": model}):
+            api._jobs["s1-stage-debug"] = {"status": "pending", "progress": "", "created_at": 0}
+            api._run_job("s1-stage-debug", {**self.payload, "bbox": self.bbox})
+        status = self.client.get("/api/detect/status/s1-stage-debug").json
+        self.assertEqual(status["request_id"], "s1-stage-debug")
+        self.assertEqual(status["error_code"], "gee_api_unavailable")
+        diagnostic = status["meta"]["diagnostic"]
+        self.assertEqual(diagnostic["stage"], "s1_t1_orbit_histogram")
+        self.assertIn("aggregate_histogram", diagnostic["operation"])
+        self.assertEqual(diagnostic["t1_s1_count_before_filters"], 9)
+        self.assertEqual(diagnostic["t1_s1_count_after_iw_desc_vv_vh_filters"], 4)
+        self.assertEqual(diagnostic["request_id"], "s1-stage-debug")
 
     def test_ai_provider_failure_is_not_reported_as_provider_fallback(self):
         gee = types.ModuleType("gee_service")
