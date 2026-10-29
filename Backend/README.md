@@ -8,7 +8,19 @@ The AI endpoint requires genuine Sentinel-1 VV/VH/VH_VV and the trained Q qualit
 
 The AI model consumes 17 channels in manifest order: B2–B12, NDVI, NDBI, VV, VH, VH_VV, and Q. The existing production checkpoint, strict loader, train-only normalization, 128×128 patch size, Q encoding `clip(n_clear / 8, 0, 1)`, and model threshold remain unchanged. A successful Earth Engine initialization or `ee.Number(1).getInfo()` confirms the authenticated client can make a basic request; it does not confirm that the Sentinel-1 collection, filters, orbit metadata, Cloud Score+, requested scenes, or raster download will work for a particular AOI and time window.
 
-For the production multi-date composite path, training defines `Q = clip(n_clear / 8, 0, 1)`, where `n_clear` counts B4 observations after linked Cloud Score+ `cs_cdf >= 0.60` masking. The training heterogeneity gate applies to raw `n_clear` (`std(n_clear) > 0.5`) before Q clipping, so a constant Q raster can be valid when the raw count varied above the clipping ceiling. GEE records raw count statistics; runtime checks source provenance, finite values, encoded range and all-zero/low-coverage nodata before applying the criterion to raw counts. Missing raw diagnostics or failed heterogeneity returns provider/date/channel details; no variation is fabricated. The single-date monsoon benchmark uses `cs_cdf` directly, but the runtime does not currently acquire that product.
+### Sentinel-1 SAR Channel Contract & Scaling
+
+The Sentinel-1 GRD pipeline composites descending IW scenes with VV and VH in linear power, converts the median back to decibels, derives the cross-channel difference `VH_VV = VH - VV`, and encodes all three SAR channels into the 17-channel array scaled as `dB × 100` (`int16` range `[-32768, 32767]`). During inference, `inference._normalize()` divides the SAR channels by `sar_extra_scale = 100.0` exactly once, recovering calibrated decibels before applying train-only Z-score normalization (`mean[13..15] = [-9.84, -17.24, -7.40] dB`).
+
+Validation separates physical instrument/data corruption from empirical training-distribution tails:
+- **Physical bounds (Hard Error):** Sentinel-1 C-band instrument limits reject corrupt no-data, numerical underflow, and sensor saturation:
+  - `VV`: `[-6000, 3000]` (-60 dB to +30 dB)
+  - `VH`: `[-6000, 2000]` (-60 dB to +20 dB)
+  - `VH_VV`: `[-6000, 1500]` (-60 dB to +15 dB)
+  - Non-finite pixels (NaN, ±Inf) are strictly rejected with offending channel diagnostics.
+- **Training distribution warnings (Soft Notice):** In dense urban and industrial areas (e.g., Nashik, Mumbai), metallic building facades, bridges, and infrastructure produce intense dihedral/trihedral corner reflections with co-polarization backscatter legitimately reaching +10 dB to +25 dB (1000 to 2500 in dB×100). The validator records a soft warning (`sar_vv_urban_reflection_notice`) in metadata, preserves the authentic physical backscatter, and allows inference to proceed.
+
+For the production multi-date composite path, training defines `Q = clip(n_clear / 8, 0, 1)`, where `n_clear` counts B4 observations after linked Cloud Score+ `cs_cdf >= 0.60` masking. The training heterogeneity gate applies to raw `n_clear` (`std(n_clear) > 0.5`) as a dataset-export QA check. In production, cloud-free urban scenes where `n_clear >= 8` across the entire AOI produce saturated Q = 1.0; this is valid high-quality input and generates an informational soft notice (`quality_signal_low_spatial_variance`) without blocking the model. Genuine defects (NaN, out-of-range, all-zero, or <5% coverage) remain hard failures.
 
 ## Architecture
 

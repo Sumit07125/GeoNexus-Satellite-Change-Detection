@@ -906,6 +906,137 @@ class ReliabilityContractTests(unittest.TestCase):
                 self.assertEqual(match["id"], "spectral")
                 self.assertEqual(match["status"], "success")
 
+    def test_sar_channel_diagnostics_helper_computes_bounded_statistics_and_percentiles(self):
+        from sar_validation import sar_channel_diagnostics
+        image = np.full((17, 128, 128), 1200.0, dtype=np.float32)
+        image[13] = -950.0   # VV: -9.5 dB
+        image[14] = -1650.0  # VH: -16.5 dB
+        image[15] = -700.0   # VH_VV: -7.0 dB
+        diag = sar_channel_diagnostics(image)
+        self.assertIn("VV", diag)
+        self.assertIn("VH", diag)
+        self.assertIn("VH_VV", diag)
+        self.assertEqual(diag["VV"]["channel_index"], 13)
+        self.assertEqual(diag["VH"]["channel_index"], 14)
+        self.assertEqual(diag["VH_VV"]["channel_index"], 15)
+        self.assertEqual(diag["VV"]["units"], "dB_x100")
+        self.assertEqual(diag["VV"]["total_pixels"], 128 * 128)
+        self.assertEqual(diag["VV"]["finite_count"], 128 * 128)
+        self.assertEqual(diag["VV"]["nonfinite_count"], 0)
+        self.assertEqual(diag["VV"]["min"], -950.0)
+        self.assertEqual(diag["VV"]["max"], -950.0)
+        self.assertEqual(len(diag["VV"]["percentiles"]), 9)
+        self.assertEqual(diag["VV"]["below_limit_count"], 0)
+        self.assertEqual(diag["VV"]["above_limit_count"], 0)
+
+    def test_sar_vv_physical_violation_reports_offending_channel_and_counts(self):
+        imagery = self._imagery(s1_used=True)
+        imagery["t1_tensor"][13, 10, 10] = 3500.0  # +35 dB, physical limit +30 dB
+        with self.assertRaises(api.PipelineError) as caught:
+            api._validate_imagery(imagery, require_sar=True)
+        self.assertEqual(caught.exception.code, "invalid_input_channels")
+        details = caught.exception.details
+        self.assertEqual(details["stage"], "sar_channel_range_validation")
+        self.assertEqual(details["channel"], "VV")
+        self.assertEqual(details["channel_index"], 13)
+        self.assertEqual(details["units"], "dB_x100")
+        self.assertAlmostEqual(details["observed_max"], 3500.0, places=1)
+        self.assertEqual(details["above_limit_count"], 1)
+        self.assertEqual(details["lower_limit"], -6000.0)
+        self.assertEqual(details["upper_limit"], 3000.0)
+        self.assertIn("all_sar_diagnostics", details)
+
+    def test_sar_vh_physical_violation_reports_offending_channel_and_counts(self):
+        imagery = self._imagery(s1_used=True)
+        imagery["t2_tensor"][14, 5, 5] = 2500.0  # +25 dB, physical limit +20 dB
+        with self.assertRaises(api.PipelineError) as caught:
+            api._validate_imagery(imagery, require_sar=True)
+        self.assertEqual(caught.exception.code, "invalid_input_channels")
+        details = caught.exception.details
+        self.assertEqual(details["stage"], "sar_channel_range_validation")
+        self.assertEqual(details["channel"], "VH")
+        self.assertEqual(details["channel_index"], 14)
+        self.assertEqual(details["above_limit_count"], 1)
+
+    def test_sar_vh_vv_physical_violation_reports_offending_channel_and_counts(self):
+        imagery = self._imagery(s1_used=True)
+        imagery["t1_tensor"][15, 20, 20] = 2000.0  # +20 dB, physical limit +15 dB
+        with self.assertRaises(api.PipelineError) as caught:
+            api._validate_imagery(imagery, require_sar=True)
+        self.assertEqual(caught.exception.code, "invalid_input_channels")
+        details = caught.exception.details
+        self.assertEqual(details["stage"], "sar_channel_range_validation")
+        self.assertEqual(details["channel"], "VH_VV")
+        self.assertEqual(details["channel_index"], 15)
+        self.assertEqual(details["above_limit_count"], 1)
+
+    def test_sar_nan_or_inf_rejected_with_specific_diagnostic(self):
+        for invalid in (np.nan, np.inf, -np.inf):
+            with self.subTest(invalid=invalid):
+                imagery = self._imagery(s1_used=True)
+                imagery["t1_tensor"][13, 0, 0] = invalid
+                with self.assertRaises(api.PipelineError) as caught:
+                    api._validate_imagery(imagery, require_sar=True)
+                self.assertEqual(caught.exception.code, "invalid_input_channels")
+                self.assertIn("NaN or infinite", str(caught.exception))
+                self.assertEqual(caught.exception.details["stage"], "sar_channel_range_validation")
+                self.assertEqual(caught.exception.details["channel"], "VV")
+
+    def test_urban_corner_reflection_vv_exceeding_10db_proceeds_with_warning(self):
+        """Exact regression test for Nashik request: 36 urban pixels with VV > +10 dB up to +16.31 dB."""
+        imagery = self._imagery(s1_used=True)
+        # Add 36 urban pixels with high VV double bounce (1037 to 1631 in dBx100)
+        y_coords = np.linspace(16, 114, 36).astype(int)
+        x_coords = np.linspace(13, 115, 36).astype(int)
+        high_values = np.linspace(1037.0, 1631.24, 36, dtype=np.float32)
+        imagery["t1_tensor"][13, y_coords, x_coords] = high_values
+        imagery["t1_tensor"][14, y_coords, x_coords] = -1450.0  # Normal VH
+        imagery["t1_tensor"][15, y_coords, x_coords] = -1450.0 - high_values  # Normal VH - VV
+
+        # Must NOT raise PipelineError — urban corner reflections are valid physical observations
+        api._validate_imagery(imagery, require_sar=True)
+
+        meta = imagery["meta"]
+        self.assertEqual(meta.get("sar_status"), "valid_with_distribution_notices")
+        warns = meta.get("input_quality", {}).get("warnings", [])
+        self.assertTrue(any(w.get("code") == "sar_vv_urban_reflection_notice" for w in warns))
+        vv_warn = next(w for w in warns if w.get("code") == "sar_vv_urban_reflection_notice")
+        self.assertEqual(vv_warn["channel"], "VV")
+        self.assertAlmostEqual(vv_warn["observed_max"], 1631.24, places=1)
+        self.assertEqual(vv_warn["outside_count"], 36)
+        self.assertIn("urban double-bounce", vv_warn["interpretation"])
+
+    def test_no_double_scaling_between_gee_and_normalize(self):
+        raw_db = np.array([-15.5, -22.3, -6.8], dtype=np.float32)
+        raw_tensor = np.zeros((17, 128, 128), dtype=np.float32)
+        raw_tensor[13:16] = raw_db[:, None, None]
+        encoded = _encode_model_tensor(raw_tensor)
+        # Verify encoded is exactly dB * 100
+        np.testing.assert_allclose(encoded[13:16, 0, 0], raw_db * 100.0, rtol=1e-5)
+        # In normalize: dividing by sar_extra_scale (100.0) recovers raw dB exactly
+        recovered_db = encoded[13:16, 0, 0] / 100.0
+        np.testing.assert_allclose(recovered_db, raw_db, rtol=1e-5)
+
+    def test_sar_validation_failure_preserves_request_context_and_does_not_invoke_model(self):
+        imagery = self._imagery(s1_used=True)
+        imagery["t1_tensor"][13, 0, 0] = 5000.0  # +50 dB, unphysical
+        gee = types.ModuleType("gee_service")
+        gee.fetch_imagery = lambda **kwargs: imagery
+        model = types.ModuleType("inference")
+        model.run_inference = lambda **kwargs: self.fail("model must not run after SAR failure")
+        with patch.dict(os.environ, {"GEE_PROJECT_ID": "test-project"}), \
+             patch.dict(sys.modules, {"gee_service": gee, "inference": model}):
+            api._jobs["sar-physical-fail"] = {"status": "pending", "progress": "", "created_at": 0}
+            api._run_job("sar-physical-fail", {**self.payload, "bbox": self.bbox})
+        job = api._jobs["sar-physical-fail"]
+        self.assertEqual(job["status"], "error")
+        self.assertEqual(job["error_code"], "invalid_input_channels")
+        diag = job["meta"]["diagnostic"]
+        self.assertEqual(diag["stage"], "sar_channel_range_validation")
+        self.assertEqual(diag["channel"], "VV")
+        self.assertIn("requested_dates", diag)
+        self.assertEqual(diag["requested_dates"]["t1"], "2021-01-01")
+
 
 if __name__ == "__main__":
     unittest.main()

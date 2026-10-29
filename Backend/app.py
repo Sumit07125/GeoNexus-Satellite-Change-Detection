@@ -45,6 +45,13 @@ def _application_build_id():
 BUILD_ID = _application_build_id()
 
 from gee_config import get_gee_configuration
+from sar_validation import (
+    sar_channel_diagnostics,
+    check_sar_channel_contracts,
+    SAR_CHANNELS,
+    SAR_PHYSICAL_LIMITS,
+    SAR_TRAINING_WARN_THRESHOLDS,
+)
 
 _startup_gee = get_gee_configuration()
 print(f"[ENV] Google Earth Engine readiness: {_startup_gee['status']}")
@@ -91,6 +98,24 @@ def _bbox_dimensions_m(bbox):
         "width": abs(bbox["lon_max"] - bbox["lon_min"]) * lon_scale,
         "height": abs(bbox["lat_max"] - bbox["lat_min"]) * lat_scale,
     }
+
+
+def _diagnostic_context(meta: dict | None) -> dict:
+    if not meta:
+        return {}
+    ctx = {}
+    for k in (
+        "provider", "preprocessing_id", "crs", "pixel_resolution_m",
+        "relative_orbit", "relative_orbit_selection_reason", "s1_common_orbits",
+        "research_zone", "orbit_pass", "window_days", "max_cloud_pct",
+        "bbox", "t1_window", "t2_window", "t1_s1_scene_count", "t2_s1_scene_count",
+    ):
+        if k in meta and meta[k] is not None:
+            ctx[k] = meta[k]
+    ctx["requested_dates"] = {"t1": meta.get("t1_date"), "t2": meta.get("t2_date")}
+    if "t1_window" in meta and "t2_window" in meta:
+        ctx["search_windows"] = {"t1": meta["t1_window"], "t2": meta["t2_window"]}
+    return ctx
 
 
 def _input_channel_diagnostics(imagery):
@@ -345,20 +370,39 @@ def _validate_imagery(imagery, require_sar=False):
                 )
     if min(t1.shape[1:]) < 128:
         raise PipelineError("area_too_small", "The AI model needs at least 128×128 pixels at 10 m. Choose an area at least about 1.3 km in each dimension.")
-    if not np.isfinite(t1).all() or not np.isfinite(t2).all():
-        raise PipelineError("invalid_input_channels", "The imagery provider returned non-finite channel values.")
     for label, image in (("T1", t1), ("T2", t2)):
+        if not np.isfinite(image[:11]).all():
+            raise PipelineError("invalid_input_channels", f"{label} optical bands contain NaN or infinite values.", {"provider": meta.get("provider", "unknown"), "date": meta.get(f"{label.lower()}_date"), "channels": INPUT_CHANNEL_ORDER[:11]})
         optical_coverage = np.mean(image[:11] > 0, axis=(1, 2))
         if np.any(optical_coverage < 0.05):
             raise PipelineError("invalid_input_channels", f"{label} imagery is missing one or more Sentinel-2 optical bands required for analysis.")
         if np.any((image[:11] < 0) | (image[:11] > 32767)):
             raise PipelineError("invalid_input_channels", f"{label} Sentinel-2 bands are outside the trained reflectance-DN storage range.", {"provider": meta.get("provider", "unknown"), "date": meta.get(f"{label.lower()}_date"), "channels": INPUT_CHANNEL_ORDER[:11]})
+        if require_sar and not np.isfinite(image[11:13]).all():
+            raise PipelineError("invalid_input_channels", f"{label} NDVI/NDBI contain NaN or infinite values.", {"provider": meta.get("provider", "unknown"), "date": meta.get(f"{label.lower()}_date"), "channels": ["NDVI", "NDBI"]})
         if require_sar and np.any(np.abs(image[11:13]) > 1.0001):
             raise PipelineError("invalid_input_channels", f"{label} NDVI/NDBI are outside their trained floating-point [-1, 1] range.", {"provider": meta.get("provider", "unknown"), "date": meta.get(f"{label.lower()}_date"), "channels": ["NDVI", "NDBI"]})
-        if require_sar and np.any(np.mean(image[13:16] != 0, axis=(1, 2)) < 0.05):
-            raise PipelineError("missing_sar_channels", f"{label} imagery is missing one or more real Sentinel-1 channels required by the model.")
-        if require_sar and np.any((image[13:16] < -5000) | (image[13:16] > 1000)):
-            raise PipelineError("invalid_input_channels", f"{label} Sentinel-1 dB × 100 channels are outside the trained storage range.", {"provider": meta.get("provider", "unknown"), "date": meta.get(f"{label.lower()}_date"), "channels": INPUT_CHANNEL_ORDER[13:16]})
+        if require_sar:
+            if np.any(np.mean(image[13:16] != 0, axis=(1, 2)) < 0.05):
+                raise PipelineError(
+                    "missing_sar_channels",
+                    f"{label} imagery is missing one or more real Sentinel-1 channels required by the model.",
+                    {"provider": meta.get("provider", "unknown"), "date": meta.get(f"{label.lower()}_date"), "channels": INPUT_CHANNEL_ORDER[13:16]},
+                )
+            # Per-channel physical limits and distribution verification
+            date = meta.get(f"{label.lower()}_date", "unknown")
+            try:
+                sar_diag, sar_warns = check_sar_channel_contracts(
+                    image, label=label, provider=meta.get("provider", "Google Earth Engine"),
+                    date=date, meta=meta,
+                )
+            except PipelineError as sar_err:
+                sar_err.details.update(_diagnostic_context(meta))
+                raise
+            meta.setdefault("sar_diagnostics", {})[label.lower()] = sar_diag
+            if sar_warns:
+                meta.setdefault("input_quality", {}).setdefault("warnings", []).extend(sar_warns)
+                meta["sar_status"] = "valid_with_distribution_notices"
     valid = (t1[2] > 100) & (t1[6] > 100) & (t2[2] > 100) & (t2[6] > 100)
     if float(valid.mean()) < 0.05:
         raise PipelineError("nodata", "Imagery contains too little valid optical coverage for analysis. Choose a smaller or clearer region/date window.")

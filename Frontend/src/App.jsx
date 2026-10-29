@@ -601,9 +601,11 @@ export default function App() {
             ? 'The selected area or downloaded grid does not meet the model’s minimum input dimensions.'
             : errorCode === 'gee_imagery_download_failed'
               ? 'Earth Engine found imagery, but the raster or thumbnail download failed.'
-              : errorCode === 'inference_failed'
-                ? 'Imagery passed acquisition and input validation, but Geo-Nexus model inference failed.'
-                : null;
+              : diagnosticStage === 'sar_channel_range_validation'
+                ? `Sentinel-1 ${acquisitionDiagnostics.channel || 'SAR'} channel backscatter is outside valid physical instrument bounds.`
+                : errorCode === 'inference_failed'
+                  ? 'Imagery passed acquisition and input validation, but Geo-Nexus model inference failed.'
+                  : null;
 
   return (
     <div className="app-wrapper">
@@ -1076,6 +1078,25 @@ export default function App() {
                       {qd.value_counts && <div>n_clear value histogram: {Object.entries(qd.value_counts).map(([k, v]) => `${k}×${v}px`).join(', ')}</div>}
                       <div style={{ marginTop: '0.4rem', color: 'var(--c-text3)' }}>
                         The Q channel is missing, non-finite, out of the [0, 1] trained range, or has less than 5% positive coverage. This is a genuine data error — check imagery availability and masking for the selected area and date range.
+                      </div>
+                    </div>
+                  );
+                })()}
+                {diagnosticStage === 'sar_channel_range_validation' && acquisitionDiagnostics && (() => {
+                  const sd = acquisitionDiagnostics;
+                  const chLabel = Array.isArray(sd.channel) ? sd.channel.join(', ') : (sd.channel || 'SAR');
+                  return (
+                    <div role="status" style={{ color: 'var(--c-text2)', fontSize: '0.76rem', lineHeight: 1.6, background: 'rgba(239,68,68,0.07)', border: '1px solid rgba(239,68,68,0.25)', borderRadius: 'var(--radius)', padding: '0.6rem 0.75rem' }}>
+                      <div style={{ fontWeight: 600, color: 'var(--c-red, #ef4444)', marginBottom: '0.35rem' }}>⚠ Sentinel-1 SAR Physical Range Validation Failed</div>
+                      <div>Affected channel: <strong>{chLabel}</strong>{sd.channel_index !== undefined ? ` (index ${sd.channel_index})` : ''} on <strong>{sd.date || 'unknown'}</strong>{sd.label ? ` (${sd.label})` : ''}</div>
+                      {sd.observed_min !== undefined && <div>Observed range: <strong>{Number(sd.observed_min).toFixed(1)} to {Number(sd.observed_max).toFixed(1)} dB×100</strong></div>}
+                      {sd.lower_limit !== undefined && <div>Physical limits: [{sd.lower_limit} to {sd.upper_limit} dB×100]</div>}
+                      {sd.total_pixels !== undefined && (
+                        <div>Outliers: {sd.below_limit_count || 0} below min, {sd.above_limit_count || 0} above max (out of {sd.total_pixels} total pixels)</div>
+                      )}
+                      {sd.spatial_distribution && <div>Spatial distribution: {sd.spatial_distribution}</div>}
+                      <div style={{ marginTop: '0.4rem', color: 'var(--c-text3)' }}>
+                        This indicates radar backscatter values outside physical instrument sensor bounds or corrupted no-data pixels. Try selecting a slightly different area or temporal window.
                       </div>
                     </div>
                   );

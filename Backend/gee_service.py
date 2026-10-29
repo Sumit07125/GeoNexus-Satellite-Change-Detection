@@ -602,8 +602,8 @@ def fetch_imagery(
         _raise_stage_error("gee_imagery_download_failed", "Earth Engine imagery thumbnails could not be retrieved for the selected extent.", "thumbnail_download", {**acquisition_diagnostics, "requested_thumbnail_shape": [out_h, out_w]}, error)
 
     try:
-        t1_tensor, t1_quality_stats = _build_tensor(s2_t1, s1_t1, bbox, output_crs)
-        t2_tensor, t2_quality_stats = _build_tensor(s2_t2, s1_t2, bbox, output_crs)
+        t1_tensor, t1_quality_stats, t1_sar_stats = _build_tensor(s2_t1, s1_t1, bbox, output_crs)
+        t2_tensor, t2_quality_stats, t2_sar_stats = _build_tensor(s2_t2, s1_t2, bbox, output_crs)
     except Exception as error:
         _raise_stage_error("gee_imagery_download_failed", "Earth Engine model-band download or array decoding failed. Check the selected extent, projection, and provider availability.", "model_tensor_download", acquisition_diagnostics, error)
     if t1_tensor.shape != t2_tensor.shape:
@@ -648,6 +648,8 @@ def fetch_imagery(
         "quality_channel_source": "per-pixel count of Sentinel-2 B4 observations after linked Cloud Score+ cs_cdf >= 0.60 masking, divided by 8 and clipped to [0,1]",
         "t1_quality_raw_stats": t1_quality_stats,
         "t2_quality_raw_stats": t2_quality_stats,
+        "t1_sar_raw_stats": t1_sar_stats,
+        "t2_sar_raw_stats": t2_sar_stats,
         "cloud_score_join": "Cloud Score+ linked by source system:index; unmatched quality bands remain masked",
         "s2_collection": "COPERNICUS/S2_SR_HARMONIZED",
         "s1_collection": "COPERNICUS/S1_GRD",
@@ -744,7 +746,34 @@ def _build_tensor(s2_img, s1_img, bbox, output_crs: str) -> tuple[np.ndarray, di
                 if cnt > 0:
                     value_counts[str(v)] = cnt
             quality_stats["value_counts"] = value_counts
-    return _encode_model_tensor(stacked), quality_stats
+
+    # Extract raw unencoded SAR diagnostics (in natural dB before ×100 encoding)
+    sar_raw = stacked[13:16]
+    sar_raw_stats: dict[str, Any] = {}
+    for idx, name in enumerate(["VV", "VH", "VH_VV"]):
+        raw_ch = sar_raw[idx]
+        fin = raw_ch[np.isfinite(raw_ch)].astype(np.float64)
+        if fin.size:
+            sar_raw_stats[name] = {
+                "channel": name,
+                "units": "dB_raw",
+                "min": round(float(fin.min()), 4),
+                "max": round(float(fin.max()), 4),
+                "mean": round(float(fin.mean()), 4),
+                "std": round(float(fin.std()), 4),
+                "percentiles_p0_p1_p50_p99_p100": [round(float(v), 2) for v in np.percentile(fin, [0, 1, 50, 99, 100])],
+                "finite_fraction": float(np.isfinite(raw_ch).mean()),
+            }
+        else:
+            sar_raw_stats[name] = {
+                "channel": name,
+                "units": "dB_raw",
+                "min": None, "max": None, "mean": None, "std": None,
+                "percentiles_p0_p1_p50_p99_p100": [],
+                "finite_fraction": 0.0,
+            }
+
+    return _encode_model_tensor(stacked), quality_stats, sar_raw_stats
 
 
 def _encode_model_tensor(raw: np.ndarray) -> np.ndarray:
