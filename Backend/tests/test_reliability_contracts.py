@@ -370,6 +370,11 @@ class ReliabilityContractTests(unittest.TestCase):
         np.testing.assert_allclose(encoded[13:16], raw[13:16] * 100)
         np.testing.assert_allclose(encoded[16], 0.5)
 
+    @unittest.skipUnless(
+        hasattr(__import__("sys").modules.get("torch", object()), "nn")
+        and hasattr(getattr(__import__("sys").modules.get("torch", object()), "nn", object()), "init"),
+        "requires real PyTorch (torch not installed or stubbed)",
+    )
     def test_production_checkpoint_loads_strictly_and_runs_one_patch(self):
         y, x = np.mgrid[:128, :128]
         t1 = np.zeros((17, 128, 128), dtype=np.float32)

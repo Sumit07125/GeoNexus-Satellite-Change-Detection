@@ -2,7 +2,10 @@ import React, { useState } from 'react';
 import { MapContainer, TileLayer, Rectangle, useMapEvents, useMap } from 'react-leaflet';
 import 'leaflet/dist/leaflet.css';
 import L from 'leaflet';
-import { bboxDimensionsKm, createSquareBbox } from '../utils/geospatial';
+import { bboxDimensionsKm, bboxDimensionsMeters, createSquareBbox } from '../utils/geospatial';
+
+// Minimum draw size in metres — prevents accidental 1-click / thin-stripe draws
+const MIN_DRAW_SIDE_M = 200;
 
 // Fix Leaflet default icon paths broken by Vite
 delete L.Icon.Default.prototype._getIconUrl;
@@ -47,6 +50,18 @@ function getBBoxDimensions(b) {
   };
 }
 
+// ── Snap a raw lat/lon bbox to the larger of its two sides (square),
+//    and ensure it is at least MIN_DRAW_SIDE_M metres on each side.
+function snapToSquare(rawB) {
+  const centerLat = (rawB.lat_min + rawB.lat_max) / 2;
+  const centerLon = (rawB.lon_min + rawB.lon_max) / 2;
+  const dims = bboxDimensionsMeters(rawB);
+  if (!dims) return rawB;
+  // Pick the larger side so we never shrink the user's intended extent
+  const sideM = Math.max(dims.width, dims.height, MIN_DRAW_SIDE_M);
+  return createSquareBbox(centerLat, centerLon, sideM / 1000);
+}
+
 // ── Draw-by-click layer with live kilometer measurements ───────
 function ClickDrawLayer({ bbox, setBbox, drawing, setDrawing, onHoverDims }) {
   const [anchor, setAnchor] = useState(null);
@@ -58,12 +73,14 @@ function ClickDrawLayer({ bbox, setBbox, drawing, setDrawing, onHoverDims }) {
       if (!anchor) {
         setAnchor(e.latlng);
       } else {
-        const b = {
+        const rawB = {
           lon_min: Math.min(anchor.lng, e.latlng.lng),
           lat_min: Math.min(anchor.lat, e.latlng.lat),
           lon_max: Math.max(anchor.lng, e.latlng.lng),
           lat_max: Math.max(anchor.lat, e.latlng.lat),
         };
+        // Snap to square so accidental thin stripes become a proper square
+        const b = snapToSquare(rawB);
         setBbox(b);
         setAnchor(null);
         setHover(null);
@@ -74,21 +91,30 @@ function ClickDrawLayer({ bbox, setBbox, drawing, setDrawing, onHoverDims }) {
     mousemove(e) {
       if (drawing && anchor) {
         setHover(e.latlng);
-        const b = {
+        const rawB = {
           lon_min: Math.min(anchor.lng, e.latlng.lng),
           lat_min: Math.min(anchor.lat, e.latlng.lat),
           lon_max: Math.max(anchor.lng, e.latlng.lng),
           lat_max: Math.max(anchor.lat, e.latlng.lat),
         };
-        if (onHoverDims) onHoverDims(getBBoxDimensions(b));
+        // Show snapped-square preview dims so user sees what they'll get
+        const snapped = snapToSquare(rawB);
+        if (onHoverDims) onHoverDims(getBBoxDimensions(snapped));
       }
     },
   });
 
-  // Live rubber-band rectangle while drawing
-  const liveRect = drawing && anchor && hover
-    ? [[Math.min(anchor.lat, hover.lat), Math.min(anchor.lng, hover.lng)],
-       [Math.max(anchor.lat, hover.lat), Math.max(anchor.lng, hover.lng)]]
+  // Live rubber-band rectangle while drawing — show snapped square preview
+  const liveSnapped = (drawing && anchor && hover)
+    ? snapToSquare({
+        lon_min: Math.min(anchor.lng, hover.lng),
+        lat_min: Math.min(anchor.lat, hover.lat),
+        lon_max: Math.max(anchor.lng, hover.lng),
+        lat_max: Math.max(anchor.lat, hover.lat),
+      })
+    : null;
+  const liveRect = liveSnapped
+    ? [[liveSnapped.lat_min, liveSnapped.lon_min], [liveSnapped.lat_max, liveSnapped.lon_max]]
     : null;
 
   return (

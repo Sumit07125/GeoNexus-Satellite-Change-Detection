@@ -723,8 +723,8 @@ def _build_tensor(s2_img, s1_img, bbox, output_crs: str) -> tuple[np.ndarray, di
     stacked = np.stack(channels, axis=0)  # [17, H, W]
 
     quality = stacked[16]
-    finite_quality = quality[np.isfinite(quality)]
-    quality_stats = {
+    finite_quality = quality[np.isfinite(quality)].astype(np.float64)
+    quality_stats: dict = {
         "source_feature": "n_clear before Q scaling/clipping",
         "valid_pixel_fraction": float(np.isfinite(quality).mean()),
         "positive_fraction": float((quality > 0).mean()),
@@ -733,6 +733,17 @@ def _build_tensor(s2_img, s1_img, bbox, output_crs: str) -> tuple[np.ndarray, di
         "mean": float(finite_quality.mean()) if finite_quality.size else None,
         "std": float(finite_quality.std()) if finite_quality.size else None,
     }
+    if finite_quality.size:
+        pcts = np.percentile(finite_quality, [5, 25, 50, 75, 95]).tolist()
+        quality_stats["percentiles_p5_p25_p50_p75_p95"] = [round(p, 3) for p in pcts]
+        max_val = int(finite_quality.max())
+        if max_val <= 30:  # Only emit histogram when scene counts are small
+            value_counts: dict[str, int] = {}
+            for v in range(0, max_val + 1):
+                cnt = int(np.sum(quality == v))
+                if cnt > 0:
+                    value_counts[str(v)] = cnt
+            quality_stats["value_counts"] = value_counts
     return _encode_model_tensor(stacked), quality_stats
 
 

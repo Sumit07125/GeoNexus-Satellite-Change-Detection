@@ -498,7 +498,11 @@ export default function App() {
             } else if (statusData.status === 'error') {
               clearInterval(pollInterval);
               clearTimeout(pollTimeout);
-              reject(new Error(statusData.error || 'Spectral job failed on server'));
+              const failure = new Error(statusData.error || 'Spectral job failed on server');
+              failure.code = statusData.error_code;
+              failure.meta = statusData.meta;
+              failure.requestId = statusData.request_id || statusData.job_id || jobId;
+              reject(failure);
             }
           } catch (pollErr) {
             clearInterval(pollInterval);
@@ -1060,6 +1064,27 @@ export default function App() {
                 {errorCode === 'area_too_small' && bbox && (
                   <button type="button" className="btn btn-primary" onClick={handleExpandAreaForAi}>Expand selected area to 1.4 km square</button>
                 )}
+                {errorCode === 'invalid_quality_channel' && errorMeta?.diagnostic && (() => {
+                  const qd = errorMeta.diagnostic;
+                  return (
+                    <div role="status" style={{ color: 'var(--c-text2)', fontSize: '0.76rem', lineHeight: 1.6, background: 'rgba(251,191,36,0.07)', border: '1px solid rgba(251,191,36,0.25)', borderRadius: 'var(--radius)', padding: '0.6rem 0.75rem' }}>
+                      <div style={{ fontWeight: 600, color: 'var(--c-amber)', marginBottom: '0.35rem' }}>⚠ Quality-Channel Heterogeneity Gate Failed</div>
+                      <div>Affected epoch: <strong>{qd.label || (qd.date ? `T${qd.date.includes('T1') ? '1' : '2'} (${qd.date})` : 'unknown')}</strong></div>
+                      {qd.requested_dates && <div>Requested dates: T1 {qd.requested_dates.t1 || '—'} · T2 {qd.requested_dates.t2 || '—'}</div>}
+                      <div>Raw n_clear std: <strong>{qd.raw_n_clear_std !== undefined ? Number(qd.raw_n_clear_std).toFixed(4) : '—'}</strong> (minimum required: 0.5)</div>
+                      <div>Raw n_clear range: {qd.raw_min !== undefined ? `${qd.raw_min} – ${qd.raw_max}` : '—'} · valid pixel fraction: {qd.valid_pixel_fraction !== undefined ? `${(qd.valid_pixel_fraction * 100).toFixed(1)}%` : '—'}</div>
+                      {qd.percentiles_p5_p25_p50_p75_p95 && <div>Percentiles (p5/p25/p50/p75/p95): {qd.percentiles_p5_p25_p50_p75_p95.map((v) => Number(v).toFixed(1)).join(' / ')}</div>}
+                      {qd.value_counts && <div>n_clear value histogram: {Object.entries(qd.value_counts).map(([k, v]) => `${k}×${v}px`).join(', ')}</div>}
+                      <div style={{ marginTop: '0.4rem', color: 'var(--c-text3)' }}>
+                        This area's cloud coverage was spatially uniform across all scenes — every pixel saw the same number of clear observations. Try widening the temporal search window (e.g., ±30 days) to include scenes from more dates with varied cloud patterns, or choose a different date pair.
+                      </div>
+                      <button type="button" className="btn btn-ghost" style={{ marginTop: '0.4rem', padding: '0.25rem 0.6rem', fontSize: '0.72rem' }}
+                        onClick={() => { setWindowDays((d) => Math.min(90, d + 15)); setError(null); setErrorCode(null); setErrorMeta(null); }}>
+                        Widen search window by 15 days
+                      </button>
+                    </div>
+                  );
+                })()}
                 <div style={{ display: 'flex', gap: '0.5rem', width: '100%' }}>
                   <button
                     className="btn btn-primary"

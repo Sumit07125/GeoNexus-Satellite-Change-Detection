@@ -267,6 +267,7 @@ def _validate_imagery(imagery, require_sar=False):
             quality_std = float(finite_quality.std()) if finite_quality.size else None
             details = {
                 "provider": provider, "date": date, "channel": "Q",
+                "label": label,
                 "preprocessing_id": meta.get("preprocessing_id", "unknown"),
                 "finite_fraction": float(np.isfinite(quality).mean()),
                 "positive_quality_fraction": float((quality > 0).mean()),
@@ -274,7 +275,13 @@ def _validate_imagery(imagery, require_sar=False):
                 "max": float(finite_quality.max()) if finite_quality.size else None,
                 "std": quality_std, "raw_n_clear_std": raw_quality_stats.get("std"),
                 "raw_n_clear_valid_pixel_fraction": raw_quality_stats.get("valid_pixel_fraction"),
+                "raw_min": raw_quality_stats.get("min"),
+                "raw_max": raw_quality_stats.get("max"),
+                "valid_pixel_fraction": raw_quality_stats.get("valid_pixel_fraction"),
                 "expected_range": [0.0, 1.0], "minimum_raw_n_clear_std": QUALITY_STD_MIN,
+                # Enhanced diagnostics from _build_tensor
+                "percentiles_p5_p25_p50_p75_p95": raw_quality_stats.get("percentiles_p5_p25_p50_p75_p95"),
+                "value_counts": raw_quality_stats.get("value_counts"),
             }
             if not np.isfinite(quality).all():
                 raise PipelineError("invalid_quality_channel", f"{label} Q input from {provider} on {date} contains NaN or infinite values; the trained Q channel must be finite and in [0, 1].", details)
@@ -502,7 +509,25 @@ def _run_job(job_id: str, payload: dict):
         failure_meta = {key: meta[key] for key in ("provider", "provider_fallback", "input_channels", "s1_used", "preprocessing_id", "t1_date", "t2_date", "quality_channel", "quality_channel_status") if "meta" in locals() and key in meta}
         failure_meta["provider_attempts"] = locals().get("provider_attempts", [])
         if isinstance(e, PipelineError):
-            failure_meta["diagnostic"] = e.details
+            diag = dict(e.details) if e.details else {}
+            # Augment with acquisition context already known at exception time
+            diag.setdefault("request_id", job_id)
+            if "requested_dates" not in diag:
+                diag["requested_dates"] = {"t1": locals().get("date_t1"), "t2": locals().get("date_t2")}
+            if "window_days" not in diag:
+                diag["window_days"] = locals().get("window_days")
+            if "max_cloud_pct" not in diag:
+                diag["max_cloud_pct"] = locals().get("max_cloud")
+            if "bbox" not in diag:
+                diag["bbox"] = locals().get("bbox")
+            # Carry over search-window strings from imagery meta if present
+            if "meta" in locals() and meta:
+                for wk in ("t1_window", "t2_window", "search_windows"):
+                    if wk in meta and wk not in diag:
+                        diag[wk] = meta[wk]
+                if "search_windows" not in diag and "t1_window" in diag and "t2_window" in diag:
+                    diag["search_windows"] = {"t1": diag["t1_window"], "t2": diag["t2_window"]}
+            failure_meta["diagnostic"] = diag
         _update_job(job_id, status="error", progress="❌ Failed", error=message, error_code=code, meta=failure_meta)
 
 
@@ -663,6 +688,8 @@ def _run_spectral_job(job_id: str, payload: dict):
         message = str(e) if isinstance(e, PipelineError) else "Spectral Index Analysis failed. Check imagery availability and server logs, then retry."
         failure_meta = {key: meta[key] for key in ("provider", "provider_fallback") if "meta" in locals() and key in meta}
         failure_meta["provider_attempts"] = locals().get("provider_attempts", [])
+        if isinstance(e, PipelineError):
+            failure_meta["diagnostic"] = e.details
         _update_job(job_id, status="error", progress="❌ Failed",
                     error=message, error_code=code, meta=failure_meta)
 
