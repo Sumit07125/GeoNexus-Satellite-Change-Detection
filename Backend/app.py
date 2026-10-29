@@ -74,7 +74,12 @@ class PipelineError(Exception):
 
 
 INPUT_CHANNEL_ORDER = ["B2", "B3", "B4", "B5", "B6", "B7", "B8", "B8A", "B9", "B11", "B12", "NDVI", "NDBI", "VV", "VH", "VH_VV", "Q"]
-QUALITY_STD_MIN = 0.5  # training applies its heterogeneity acceptance test to raw n_clear, before Q clipping
+QUALITY_STD_MIN = 0.5  # Training-data export QA threshold only — NOT a runtime inference gate.
+# Evidence: FINAL_ARCH_3.md §15.1 line "std MUST be > 0.5" is a GEE preflight checklist
+# item verifying that the *training dataset* has spatial Q variation (so QualityGate learns
+# real signal rather than a dead constant).  It is not a contract on individual production
+# AOIs.  A saturated Q = 1.0 everywhere is valid input: every pixel had >= 8 clear looks.
+QUALITY_LOW_VARIANCE_WARN_THRESHOLD = 0.5  # Warn when raw std is low but do not block.
 AI_MIN_DIMENSION_M = 1280
 
 
@@ -301,8 +306,43 @@ def _validate_imagery(imagery, require_sar=False):
             raw_n_clear_std = raw_quality_stats.get("std")
             if not isinstance(raw_n_clear_std, (int, float)) or not math.isfinite(raw_n_clear_std):
                 raise PipelineError("invalid_quality_channel", f"{label} Q input from {provider} on {date} is missing the raw n_clear diagnostic required by the trained preprocessing contract.", details)
-            if raw_n_clear_std <= QUALITY_STD_MIN:
-                raise PipelineError("invalid_quality_channel", f"{label} raw n_clear from {provider} on {date} does not meet the trained composite heterogeneity check (std(n_clear) must exceed {QUALITY_STD_MIN:.1f} observations). The model input Q is n_clear/8 clipped to [0,1]; check the selected date window and cloud-score matching.", details)
+            # ── SOFT WARNING: low spatial variance ─────────────────────────
+            # The std(n_clear) > 0.5 check in FINAL_ARCH_3.md §15.1 is a
+            # *training-data export* QA checklist item ensuring the training
+            # dataset has spatial Q variation so QualityGate learns real signal.
+            # It is NOT a production inference gate.  A saturated Q (n_clear >= 8
+            # everywhere → encoded Q = 1.0 everywhere) is a genuine, valid,
+            # high-quality input.  The QualityGate handles it by construction
+            # (gate bias initialised to 2.0, sigmoid ≈ 0.88, favouring optical
+            # when Q is uniform).  Do NOT block inference here.
+            if raw_n_clear_std <= QUALITY_LOW_VARIANCE_WARN_THRESHOLD:
+                encoded_min = round(float(np.clip(raw_min / 8.0, 0.0, 1.0)), 4) if isinstance(raw_min, (int, float)) else None
+                encoded_max = round(float(np.clip(raw_max / 8.0, 0.0, 1.0)), 4) if isinstance(raw_max, (int, float)) else None
+                warn_entry = {
+                    "code": "quality_signal_low_spatial_variance",
+                    "date": date, "label": label,
+                    "raw_n_clear_std": round(raw_n_clear_std, 6),
+                    "encoded_q_std": round(quality_std, 6) if quality_std is not None else None,
+                    "raw_min": raw_min, "raw_max": raw_max,
+                    "encoded_min": encoded_min, "encoded_max": encoded_max,
+                    "percentiles": raw_quality_stats.get("percentiles_p5_p25_p50_p75_p95"),
+                    "value_counts": raw_quality_stats.get("value_counts"),
+                    "interpretation": (
+                        "Q is real and valid but spatially uniform/saturated: every pixel had a "
+                        "similar number of clear observations. This is expected for cloud-free urban "
+                        "scenes. The QualityGate receives a valid high-quality signal; inference "
+                        "proceeds. The resulting prediction carries this warning in its metadata."
+                    ),
+                }
+                existing_warns = meta.setdefault("input_quality", {}).setdefault("warnings", [])
+                existing_warns.append(warn_entry)
+                meta["input_quality"]["status"] = "valid_uniform_or_saturated"
+                imagery["meta"] = meta
+                app.logger.info(
+                    "[validate_imagery] WARN quality_signal_low_spatial_variance %s: "
+                    "raw_std=%.4f encoded_std=%.4f raw=[%s,%s] encoded=[%s,%s] — inference proceeds",
+                    label, raw_n_clear_std, quality_std or 0, raw_min, raw_max, encoded_min, encoded_max,
+                )
     if min(t1.shape[1:]) < 128:
         raise PipelineError("area_too_small", "The AI model needs at least 128×128 pixels at 10 m. Choose an area at least about 1.3 km in each dimension.")
     if not np.isfinite(t1).all() or not np.isfinite(t2).all():

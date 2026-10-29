@@ -371,9 +371,9 @@ class ReliabilityContractTests(unittest.TestCase):
         np.testing.assert_allclose(encoded[16], 0.5)
 
     @unittest.skipUnless(
-        hasattr(__import__("sys").modules.get("torch", object()), "nn")
-        and hasattr(getattr(__import__("sys").modules.get("torch", object()), "nn", object()), "init"),
-        "requires real PyTorch (torch not installed or stubbed)",
+        __import__("importlib.util", fromlist=["util"]).find_spec("torch") is not None
+        and __import__("importlib.util", fromlist=["util"]).find_spec("torchvision") is not None,
+        "requires real PyTorch + torchvision (not installed in active environment)",
     )
     def test_production_checkpoint_loads_strictly_and_runs_one_patch(self):
         y, x = np.mgrid[:128, :128]
@@ -462,15 +462,27 @@ class ReliabilityContractTests(unittest.TestCase):
         self.assertEqual(caught.exception.code, "imagery_unavailable")
         self.assertEqual(caught.exception.details["date"], "2022-01-01")
 
-    def test_constant_q_without_raw_nclear_heterogeneity_is_rejected(self):
+    def test_constant_q_without_raw_nclear_heterogeneity_proceeds_with_warning(self):
+        # Previously this raised PipelineError("invalid_quality_channel") for low raw-std.
+        # The std(n_clear) > 0.5 check is a *training-data export* QA item, NOT a production
+        # inference gate (see FINAL_ARCH_3.md §15.1).  A spatially uniform Q=0.5 (n_clear=4,
+        # every pixel identical) is valid high-quality input; the QualityGate handles it by
+        # design (bias init=2.0, sigmoid≈0.88).  Inference must NOT be blocked; a soft warning
+        # is appended to imagery["meta"]["input_quality"]["warnings"] instead.
         imagery = self._imagery(s1_used=True)
         imagery["t1_tensor"][16] = 0.5
         imagery["meta"]["t1_quality_raw_stats"]["std"] = 0.0
-        with self.assertRaises(api.PipelineError) as caught:
-            api._validate_imagery(imagery, require_sar=True)
-        self.assertEqual(caught.exception.code, "invalid_quality_channel")
-        self.assertEqual(caught.exception.details["channel"], "Q")
-        self.assertEqual(caught.exception.details["date"], "2021-01-01")
+        # Must NOT raise
+        api._validate_imagery(imagery, require_sar=True)
+        iq = imagery["meta"].get("input_quality", {})
+        self.assertEqual(iq.get("status"), "valid_uniform_or_saturated")
+        warns = iq.get("warnings", [])
+        self.assertTrue(
+            any(w["code"] == "quality_signal_low_spatial_variance" for w in warns),
+            f"Expected quality_signal_low_spatial_variance warning; got: {warns}",
+        )
+        t1_warn = next(w for w in warns if w.get("label") == "T1")
+        self.assertAlmostEqual(t1_warn["raw_n_clear_std"], 0.0, places=4)
 
     def test_clipped_constant_q_is_allowed_when_raw_nclear_meets_training_gate(self):
         imagery = self._imagery(s1_used=True)
@@ -478,6 +490,76 @@ class ReliabilityContractTests(unittest.TestCase):
         imagery["meta"]["t1_scene_count"] = 30
         imagery["meta"]["t1_quality_raw_stats"].update({"std": 3.0, "min": 10.0, "max": 20.0})
         api._validate_imagery(imagery, require_sar=True)
+
+    def test_saturated_q_with_real_logged_histogram_proceeds_with_warning(self):
+        """Regression test: T2 n_clear={10:467px, 11:36px, 12:41113px}, std=0.2126.
+
+        This is the exact histogram logged from the production failing request
+        (T1=2021-03-15, T2=2024-03-15, ±15 days, 30% cloud, GEE).  All pixels
+        have n_clear >= 10, so Q = clip(n_clear/8, 0, 1) = 1.0 everywhere.
+        raw_n_clear_std = 0.2126 < 0.5 → was wrongly blocked; must now warn only.
+        """
+        raw_values = np.concatenate([
+            np.full(467, 10, dtype=np.float32),
+            np.full(36, 11, dtype=np.float32),
+            np.full(41113, 12, dtype=np.float32),
+        ])
+        self.assertAlmostEqual(float(raw_values.std()), 0.2126, places=2)
+        # Build a 17-channel (17×128×128) tensor with valid values
+        tensor = np.ones((17, 128, 128), dtype=np.float32)
+        tensor[:11] = 1200.0       # optical DN: valid [0, 32767]
+        tensor[11] = 0.42          # NDVI: valid [-1, 1]
+        tensor[12] = -0.13         # NDBI: valid [-1, 1]
+        tensor[13] = -950.0        # VV: valid dB*100
+        tensor[14] = -1650.0       # VH: valid dB*100
+        tensor[15] = -700.0        # VH_VV: valid dB*100
+        tensor[16] = 1.0           # Q: saturated (n_clear >= 8 → clip = 1.0 everywhere)
+        imagery = {
+            "t1_tensor": tensor,
+            "t2_tensor": tensor.copy(),
+            "meta": {
+                "provider": "Google Earth Engine",
+                "preprocessing_id": "gee_s2_s1_median_composite_v2",
+                "s1_used": True,
+                "sar_channels_available": True,
+                "quality_channel_status": "real",
+                "quality_channel": "clip(n_clear / 8, 0, 1)",
+                "pixel_resolution_m": 10,
+                "crs": "EPSG:32643",
+                "t1_scene_count": 12,
+                "t2_scene_count": 12,
+                "t1_s1_scene_count": 4,
+                "t2_s1_scene_count": 4,
+                "t1_date": "2021-03-15",
+                "t2_date": "2024-03-15",
+                # T1: healthy std=0.35, well above warn threshold
+                "t1_quality_raw_stats": {
+                    "std": 0.35, "min": 8.0, "max": 12.0,
+                    "valid_pixel_fraction": 1.0, "mean": 11.0,
+                },
+                # T2: the exact real logged stats (std=0.2126 < 0.5)
+                "t2_quality_raw_stats": {
+                    "std": 0.2126, "min": 10.0, "max": 12.0,
+                    "valid_pixel_fraction": 1.0, "mean": 11.9,
+                    "value_counts": {"10": 467, "11": 36, "12": 41113},
+                },
+            },
+        }
+        # Must NOT raise PipelineError; low std is a soft warning only.
+        api._validate_imagery(imagery, require_sar=True)
+        iq = imagery["meta"].get("input_quality", {})
+        self.assertEqual(iq.get("status"), "valid_uniform_or_saturated",
+                         "Expected valid_uniform_or_saturated status for real saturated input")
+        warns = iq.get("warnings", [])
+        codes = [w["code"] for w in warns]
+        self.assertIn("quality_signal_low_spatial_variance", codes,
+                      f"Expected low-variance warning; got codes: {codes}")
+        # Only T2 should warn (T1 has std=0.35, above threshold? No: 0.35 < 0.5 → T1 also warns)
+        t2_warn = next((w for w in warns if w.get("label") == "T2"), None)
+        self.assertIsNotNone(t2_warn, "Expected T2-labelled warning entry")
+        self.assertAlmostEqual(t2_warn["raw_n_clear_std"], 0.2126, places=3)
+        self.assertEqual(t2_warn["encoded_max"], 1.0,
+                         "n_clear=12, Q=clip(12/8,0,1)=1.0 — encoded_max must be 1.0")
 
     def test_raw_nclear_diagnostics_reject_nonfinite_and_impossible_counts(self):
         cases = [
@@ -709,22 +791,38 @@ class ReliabilityContractTests(unittest.TestCase):
         self.assertEqual(calls[0]["lon_min"], 72.8434)
         self.assertEqual(api._jobs["maharashtra-exact"]["result"]["engine"], "geonexus_ai")
 
-    def test_gee_quality_failure_returns_provider_date_and_channel(self):
+    def test_gee_quality_low_variance_proceeds_with_warning_and_runs_model(self):
+        # std=0.0 (all pixels identical n_clear) → soft warning only; inference must proceed.
         imagery = self._imagery(s1_used=True)
         imagery["t1_tensor"][16] = 0.5
         imagery["meta"]["t1_quality_raw_stats"].update({"std": 0.0, "min": 4.0, "max": 4.0})
         gee = types.ModuleType("gee_service")
         gee.fetch_imagery = lambda **kwargs: imagery
         model = types.ModuleType("inference")
-        model.run_inference = lambda **kwargs: self.fail("invalid Q must stop before inference")
-        with patch.dict(os.environ, {"GEE_PROJECT_ID": "test-project"}), patch.dict(sys.modules, {"gee_service": gee, "inference": model}):
-            api._jobs["gee-invalid-q"] = {"status": "pending", "progress": "", "created_at": 0}
-            api._run_job("gee-invalid-q", {**self.payload, "bbox": self.bbox})
-        job = api._jobs["gee-invalid-q"]
-        self.assertEqual(job["error_code"], "invalid_quality_channel")
-        self.assertEqual(job["meta"]["diagnostic"]["provider"], "Google Earth Engine")
-        self.assertEqual(job["meta"]["diagnostic"]["date"], "2021-01-01")
-        self.assertEqual(job["meta"]["diagnostic"]["channel"], "Q")
+        model.run_inference = lambda **kwargs: {
+            "model_version": "3.2.0", "threshold_source": "manifest",
+            "change_mask_b64": "mask", "binary_mask_b64": "binary",
+            "change_prob_b64": "prob", "overlay_b64": "overlay", "dynamics": {},
+            "stats": {"change_pct": 1.0, "changed_pixels": 1, "total_pixels": 16384,
+                      "output_size": [128, 128], "threshold": 0.28},
+        }
+        with patch.dict(os.environ, {"GEE_PROJECT_ID": "test-project"}), \
+             patch.dict(sys.modules, {"gee_service": gee, "inference": model}), \
+             patch.object(storage_manager, "save_prediction", return_value={"id": "gee-q-warn"}):
+            api._jobs["gee-q-warn"] = {"status": "pending", "progress": "", "created_at": 0}
+            api._run_job("gee-q-warn", {**self.payload, "bbox": self.bbox})
+        job = api._jobs["gee-q-warn"]
+        self.assertEqual(job["status"], "done",
+                         f"Expected done but got error: {job.get('error_code')} — {job.get('error')}")
+        # The result meta must carry the quality warning
+        result_meta = job["result"]["meta"]
+        iq = result_meta.get("input_quality", {})
+        self.assertEqual(iq.get("status"), "valid_uniform_or_saturated")
+        warns = iq.get("warnings", [])
+        self.assertTrue(
+            any(w["code"] == "quality_signal_low_spatial_variance" for w in warns),
+            f"Expected low-variance warning in result meta; got: {warns}",
+        )
 
     def test_ai_inference_failure_is_terminal_and_structured(self):
         gee = types.ModuleType("gee_service")

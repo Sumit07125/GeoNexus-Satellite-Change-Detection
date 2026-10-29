@@ -1068,20 +1068,15 @@ export default function App() {
                   const qd = errorMeta.diagnostic;
                   return (
                     <div role="status" style={{ color: 'var(--c-text2)', fontSize: '0.76rem', lineHeight: 1.6, background: 'rgba(251,191,36,0.07)', border: '1px solid rgba(251,191,36,0.25)', borderRadius: 'var(--radius)', padding: '0.6rem 0.75rem' }}>
-                      <div style={{ fontWeight: 600, color: 'var(--c-amber)', marginBottom: '0.35rem' }}>⚠ Quality-Channel Heterogeneity Gate Failed</div>
-                      <div>Affected epoch: <strong>{qd.label || (qd.date ? `T${qd.date.includes('T1') ? '1' : '2'} (${qd.date})` : 'unknown')}</strong></div>
+                      <div style={{ fontWeight: 600, color: 'var(--c-amber)', marginBottom: '0.35rem' }}>⚠ Quality-Channel Input Error</div>
+                      <div>Affected epoch: <strong>{qd.label || (qd.date ? qd.date : 'unknown')}</strong>{qd.date ? ` (${qd.date})` : ''}</div>
                       {qd.requested_dates && <div>Requested dates: T1 {qd.requested_dates.t1 || '—'} · T2 {qd.requested_dates.t2 || '—'}</div>}
-                      <div>Raw n_clear std: <strong>{qd.raw_n_clear_std !== undefined ? Number(qd.raw_n_clear_std).toFixed(4) : '—'}</strong> (minimum required: 0.5)</div>
                       <div>Raw n_clear range: {qd.raw_min !== undefined ? `${qd.raw_min} – ${qd.raw_max}` : '—'} · valid pixel fraction: {qd.valid_pixel_fraction !== undefined ? `${(qd.valid_pixel_fraction * 100).toFixed(1)}%` : '—'}</div>
                       {qd.percentiles_p5_p25_p50_p75_p95 && <div>Percentiles (p5/p25/p50/p75/p95): {qd.percentiles_p5_p25_p50_p75_p95.map((v) => Number(v).toFixed(1)).join(' / ')}</div>}
                       {qd.value_counts && <div>n_clear value histogram: {Object.entries(qd.value_counts).map(([k, v]) => `${k}×${v}px`).join(', ')}</div>}
                       <div style={{ marginTop: '0.4rem', color: 'var(--c-text3)' }}>
-                        This area's cloud coverage was spatially uniform across all scenes — every pixel saw the same number of clear observations. Try widening the temporal search window (e.g., ±30 days) to include scenes from more dates with varied cloud patterns, or choose a different date pair.
+                        The Q channel is missing, non-finite, out of the [0, 1] trained range, or has less than 5% positive coverage. This is a genuine data error — check imagery availability and masking for the selected area and date range.
                       </div>
-                      <button type="button" className="btn btn-ghost" style={{ marginTop: '0.4rem', padding: '0.25rem 0.6rem', fontSize: '0.72rem' }}
-                        onClick={() => { setWindowDays((d) => Math.min(90, d + 15)); setError(null); setErrorCode(null); setErrorMeta(null); }}>
-                        Widen search window by 15 days
-                      </button>
                     </div>
                   );
                 })()}
@@ -1308,12 +1303,44 @@ export default function App() {
                   </div>
                 </div>
               ) : activeDisplayedResult ? (
-                <ResultsPanel
-                  data={activeDisplayedResult}
-                  activeFilters={overlayFilters}
-                  onToggleFilter={handleToggleOverlayFilter}
-                  onSetAllFilters={handleSetAllOverlayFilters}
-                />
+                <>
+                  {/* ── Non-blocking quality-distribution notice ── */}
+                  {activeDisplayedResult?.meta?.input_quality?.warnings?.length > 0 && (
+                    <div style={{
+                      margin: '0 0 0.75rem 0',
+                      padding: '0.65rem 0.85rem',
+                      background: 'rgba(251,191,36,0.07)',
+                      border: '1px solid rgba(251,191,36,0.22)',
+                      borderRadius: 'var(--radius)',
+                      fontSize: '0.76rem',
+                      lineHeight: 1.6,
+                      color: 'var(--c-text2)',
+                    }}>
+                      <div style={{ fontWeight: 600, color: 'var(--c-amber)', marginBottom: '0.3rem' }}>
+                        ⚠ Quality Distribution Notice — Inference Proceeded
+                      </div>
+                      {activeDisplayedResult.meta.input_quality.warnings.map((w, i) => (
+                        <div key={i} style={{ marginBottom: '0.25rem' }}>
+                          <strong>{w.label} ({w.date}):</strong> Q channel saturated/uniform —
+                          raw n_clear std={w.raw_n_clear_std !== undefined ? Number(w.raw_n_clear_std).toFixed(4) : '—'},
+                          encoded Q∈[{w.encoded_min ?? '—'}, {w.encoded_max ?? '—'}].{' '}
+                          {w.value_counts && (
+                            <span>n_clear histogram: {Object.entries(w.value_counts).map(([k, v]) => `${k}×${v}px`).join(', ')}. </span>
+                          )}
+                        </div>
+                      ))}
+                      <div style={{ marginTop: '0.25rem', color: 'var(--c-text3)' }}>
+                        Every pixel had a similar number of clear observations — this is expected for cloud-free urban scenes and does not indicate a data problem. The AI model's QualityGate processed this as valid high-quality input. Verify with Spectral Analysis if uncertain.
+                      </div>
+                    </div>
+                  )}
+                  <ResultsPanel
+                    data={activeDisplayedResult}
+                    activeFilters={overlayFilters}
+                    onToggleFilter={handleToggleOverlayFilter}
+                    onSetAllFilters={handleSetAllOverlayFilters}
+                  />
+                </>
               ) : (
                 <div className="prediction-empty-card">
                   <span style={{ fontSize: '48px' }}>🛰️</span>

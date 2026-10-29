@@ -1,11 +1,17 @@
 """
 conftest.py — pytest configuration for Geo-Nexus backend test suite.
 
-Stubs out heavy optional dependencies (torch, earthengine-api, rasterio,
-scipy, opencv) so the test suite can be imported and run without a full
-ML environment. Tests that actually exercise these libraries are expected
-to skip themselves or use their own mocks.
+Stubs out heavy optional dependencies (earthengine-api, rasterio,
+scipy, opencv, pystac) so the test suite can be imported and run without a
+full geospatial environment.
+
+torch / torchvision are stubbed ONLY when they are not already installed in
+the active Python environment.  When running under system Python (which has
+real PyTorch), torch is left untouched so checkpoint and inference tests can
+use the real implementation.  Use _TORCH_AVAILABLE from this module in
+@unittest.skipUnless decorators for tests that require real PyTorch.
 """
+import importlib.util
 import sys
 import types
 
@@ -20,8 +26,16 @@ def _make_stub(name: str, **attrs) -> types.ModuleType:
     return mod
 
 
+# ── Detect real torch BEFORE registering any stubs ────────────────────────────
+# importlib.util.find_spec is used rather than try/import so that we don't
+# accidentally trigger partial imports of torch sub-packages.
+_TORCH_AVAILABLE: bool = (
+    importlib.util.find_spec("torch") is not None
+    and importlib.util.find_spec("torchvision") is not None
+)
+
 # ── torch ──────────────────────────────────────────────────────────────────────
-if "torch" not in sys.modules:
+if not _TORCH_AVAILABLE and "torch" not in sys.modules:
     torch_mod = _make_stub("torch")
     torch_mod.cuda = _make_stub("torch.cuda")
     torch_mod.cuda.is_available = lambda: False
@@ -68,7 +82,7 @@ if "torch" not in sys.modules:
     _make_stub("torch.utils.data")
 
 # ── torchvision ────────────────────────────────────────────────────────────────
-if "torchvision" not in sys.modules:
+if not _TORCH_AVAILABLE and "torchvision" not in sys.modules:
     tv_mod = _make_stub("torchvision")
     tv_models = _make_stub("torchvision.models")
 
@@ -144,3 +158,4 @@ if "pystac" not in sys.modules:
 if "osgeo" not in sys.modules:
     _make_stub("osgeo")
     _make_stub("osgeo.gdal")
+
