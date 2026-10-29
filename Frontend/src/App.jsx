@@ -583,6 +583,8 @@ export default function App() {
     /s1_t1_(?:orbit_discovery|base_count|filtered_count|orbit_histogram|orbit_metadata_parse|collection_build|filter_build)/.test(diagnosticStage);
   const failureStageMessage = isT1OrbitQueryFailure
     ? 'Earth Engine failed while querying Sentinel-1 metadata for T1. This is a metadata-query failure; it does not mean no orbits were found.'
+    : errorCode === 'gee_s1_orbit_metadata_invalid'
+      ? 'Earth Engine returned malformed Sentinel-1 relative-orbit metadata. Orbit parsing failed, so shared-orbit selection was not attempted.'
     : errorCode === 'gee_s1_no_scenes_t1' || errorCode === 'gee_s1_no_scenes_t2'
       ? 'The Sentinel-1 query completed, but no eligible scenes matched the requested date window.'
       : errorCode === 'gee_no_common_s1_orbit'
@@ -1017,6 +1019,7 @@ export default function App() {
                       <dt>T2 requested date / window</dt><dd>{acquisitionDiagnostics.requested_dates?.t2 || 'unknown'} · {acquisitionDiagnostics.search_windows?.t2?.start || 'unknown'} through {acquisitionDiagnostics.search_windows?.t2?.end_inclusive || 'unknown'}</dd>
                       <dt>Sentinel-1 counts T1</dt><dd>Initial: {acquisitionDiagnostics.t1_s1_count_before_filters ?? 'not obtained'} · Eligible: {acquisitionDiagnostics.t1_s1_count_after_iw_desc_vv_vh_filters ?? 'not obtained'} · Orbits: {acquisitionDiagnostics.t1_s1_orbits ? JSON.stringify(acquisitionDiagnostics.t1_s1_orbits) : 'not obtained'}</dd>
                       <dt>Sentinel-1 counts T2</dt><dd>Initial: {acquisitionDiagnostics.t2_s1_count_before_filters ?? 'not obtained'} · Eligible: {acquisitionDiagnostics.t2_s1_count_after_iw_desc_vv_vh_filters ?? 'not obtained'} · Orbits: {acquisitionDiagnostics.t2_s1_orbits ? JSON.stringify(acquisitionDiagnostics.t2_s1_orbits) : 'not obtained'}</dd>
+                      <dt>Raw orbit histogram response</dt><dd>{acquisitionDiagnostics.s1_orbit_histogram !== undefined ? JSON.stringify(acquisitionDiagnostics.s1_orbit_histogram) : 'not obtained'}</dd>
                       <dt>Common / selected orbit</dt><dd>{Array.isArray(acquisitionDiagnostics.s1_common_orbits) ? acquisitionDiagnostics.s1_common_orbits.join(', ') || 'none' : 'not determined'} · selected {acquisitionDiagnostics.selected_relative_orbit ?? 'none'}</dd>
                       {acquisitionDiagnostics.frozen_relative_orbit !== undefined && <><dt>Frozen research orbit</dt><dd>{acquisitionDiagnostics.frozen_relative_orbit}</dd></>}
                       <dt>Was T2 Sentinel-1 queried?</dt><dd>{acquisitionDiagnostics.t2_s1_count_before_filters !== undefined ? 'Yes' : /s1_t1_/.test(diagnosticStage) ? 'No; T1 failed first' : 'Unknown'}</dd>

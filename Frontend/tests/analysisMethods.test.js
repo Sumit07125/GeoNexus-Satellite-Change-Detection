@@ -64,6 +64,14 @@ test('T1 Sentinel-1 query errors show a metadata failure and expandable sanitize
   assert.match(app, /metadata-query failure; it does not mean no orbits were found/i);
 });
 
+test('malformed orbit metadata is shown as a parse failure with its histogram response', async () => {
+  const app = await readFile(new URL('../src/App.jsx', import.meta.url), 'utf8');
+  assert.match(app, /gee_s1_orbit_metadata_invalid/);
+  assert.match(app, /malformed Sentinel-1 relative-orbit metadata/);
+  assert.match(app, /shared-orbit selection was not attempted/);
+  assert.match(app, /s1_orbit_histogram/);
+});
+
 test('backend build ID is displayed and request payload uses the active bbox', async () => {
   const app = await readFile(new URL('../src/App.jsx', import.meta.url), 'utf8');
   assert.match(app, /data\.build_id/);

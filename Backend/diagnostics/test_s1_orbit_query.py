@@ -107,10 +107,13 @@ def _query_window(label: str, target: str, args, bbox):
             raise ValueError("Orbit histogram is not a dictionary")
         orbit_counts = {}
         for raw_orbit, raw_count in histogram.items():
-            orbit, count = int(raw_orbit), int(raw_count)
-            if str(orbit) != str(raw_orbit) or not 1 <= orbit <= 175:
+            orbit = gee_service._parse_integral_number(raw_orbit, "relative orbit ID")
+            count = gee_service._parse_integral_number(raw_count, f"scene count for orbit {orbit}")
+            if not 1 <= orbit <= 175:
                 raise ValueError(f"Invalid orbit ID: {raw_orbit!r}")
-            if isinstance(raw_count, bool) or count != raw_count or count <= 0:
+            if orbit in orbit_counts:
+                raise ValueError(f"Duplicate normalized orbit ID: {orbit}")
+            if count <= 0:
                 raise ValueError(f"Invalid orbit scene count: {raw_count!r}")
             orbit_counts[orbit] = count
         if eligible_count == 0 and orbit_counts:

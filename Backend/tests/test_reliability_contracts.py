@@ -129,6 +129,63 @@ class ReliabilityContractTests(unittest.TestCase):
         self.assertEqual(caught.exception.details["stage"], "s1_t1_orbit_metadata_parse")
         self.assertEqual(caught.exception.details["s1_orbit_histogram"], {"bad-orbit": 2})
 
+    def test_s1_histogram_accepts_integer_valued_numeric_orbit_ids(self):
+        for raw_orbit in ("34.0", 34.0, "34", 34):
+            with self.subTest(raw_orbit=raw_orbit):
+                _, orbit_counts, _ = self._mock_s1_candidate_query(
+                    eligible_count=3, histogram={raw_orbit: 3}
+                )
+                self.assertEqual(orbit_counts, {34: 3})
+        _, orbit_counts, _ = self._mock_s1_candidate_query(
+            eligible_count=3, histogram={34.0: 3.0}
+        )
+        self.assertEqual(orbit_counts, {34: 3})
+
+    def test_s1_histogram_rejects_invalid_orbit_ids(self):
+        invalid_orbits = (
+            "34.5", "NaN", "inf", "-inf", True, None, "not-a-number", 0, -1, 176,
+        )
+        for raw_orbit in invalid_orbits:
+            with self.subTest(raw_orbit=raw_orbit), self.assertRaises(gee_service.GEEAcquisitionError) as caught:
+                self._mock_s1_candidate_query(eligible_count=1, histogram={raw_orbit: 1})
+            self.assertEqual(caught.exception.code, "gee_s1_orbit_metadata_invalid")
+            self.assertEqual(caught.exception.details["stage"], "s1_t1_orbit_metadata_parse")
+
+    def test_s1_histogram_rejects_invalid_scene_counts(self):
+        invalid_counts = (0, -1, 1.5, "NaN", "inf", float("nan"), float("inf"), True, None)
+        for raw_count in invalid_counts:
+            with self.subTest(raw_count=raw_count), self.assertRaises(gee_service.GEEAcquisitionError) as caught:
+                self._mock_s1_candidate_query(eligible_count=1, histogram={"34.0": raw_count})
+            self.assertEqual(caught.exception.code, "gee_s1_orbit_metadata_invalid")
+            self.assertEqual(caught.exception.details["stage"], "s1_t1_orbit_metadata_parse")
+
+    def test_s1_histogram_rejects_duplicate_normalized_orbits_and_count_mismatch(self):
+        with self.assertRaises(gee_service.GEEAcquisitionError) as duplicate:
+            self._mock_s1_candidate_query(eligible_count=2, histogram={"34": 1, "34.0": 1})
+        self.assertEqual(duplicate.exception.code, "gee_s1_orbit_metadata_invalid")
+        self.assertIn("duplicate normalized", duplicate.exception.details["technical_reason"])
+
+        with self.assertRaises(gee_service.GEEAcquisitionError) as mismatch:
+            self._mock_s1_candidate_query(eligible_count=3, histogram={"34.0": 2})
+        self.assertEqual(mismatch.exception.code, "gee_s1_orbit_metadata_invalid")
+        self.assertIn("did not match", mismatch.exception.details["technical_reason"])
+
+    def test_valid_s1_histogram_proceeds_to_shared_orbit_selection(self):
+        _, t1_orbits, _ = self._mock_s1_candidate_query(eligible_count=3, histogram={"34.0": 3})
+        _, t2_orbits, _ = self._mock_s1_candidate_query(
+            eligible_count=4, histogram={34.0: 4}
+        )
+        selected, common, _ = gee_service.choose_shared_orbit(t1_orbits, t2_orbits)
+        self.assertEqual(t1_orbits, {34: 3})
+        self.assertEqual(t2_orbits, {34: 4})
+        self.assertEqual((selected, common), (34, [34]))
+
+    def test_parser_failure_is_not_mislabeled_as_no_common_orbit(self):
+        with self.assertRaises(gee_service.GEEAcquisitionError) as caught:
+            self._mock_s1_candidate_query(eligible_count=3, histogram={"34.5": 3})
+        self.assertEqual(caught.exception.code, "gee_s1_orbit_metadata_invalid")
+        self.assertNotEqual(caught.exception.code, "gee_no_common_s1_orbit")
+
     def test_empty_s1_collection_and_empty_histogram_have_distinct_meanings(self):
         with self.assertRaises(gee_service.GEEAcquisitionError) as empty_collection:
             self._mock_s1_candidate_query(base_count=0, eligible_count=0, histogram=None)
@@ -531,6 +588,37 @@ class ReliabilityContractTests(unittest.TestCase):
         self.assertEqual(api._jobs["stac-ai"]["error_code"], "gee_project_access_denied")
         self.assertEqual(api._jobs["stac-ai"]["meta"]["provider_attempts"][0]["provider"], "Google Earth Engine")
         self.assertEqual(api._jobs["stac-ai"]["meta"]["diagnostic"]["requested_dates"]["t1"], "2021-01-01")
+
+    def test_s1_histogram_parse_failure_never_invokes_model_inference(self):
+        error = gee_service.GEEAcquisitionError(
+            "gee_s1_orbit_metadata_invalid",
+            "Earth Engine returned malformed Sentinel-1 orbit metadata.",
+            {
+                "provider": "Google Earth Engine",
+                "stage": "s1_t1_orbit_metadata_parse",
+                "operation": "parse relativeOrbitNumber_start histogram",
+                "t1_s1_orbits": None,
+                "s1_orbit_histogram": {"34.0": 3},
+                "exception_type": "ValueError",
+                "technical_reason": "invalid orbit metadata",
+            },
+        )
+        gee = types.ModuleType("gee_service")
+        gee.fetch_imagery = lambda **kwargs: (_ for _ in ()).throw(error)
+        stac = types.ModuleType("sentinel_stac_service")
+        stac.fetch_imagery = lambda **kwargs: self.fail("AI must not use STAC after parser failure")
+        model = types.ModuleType("inference")
+        model.run_inference = lambda **kwargs: self.fail("model must not run after parser failure")
+        with patch.dict(sys.modules, {
+            "gee_service": gee,
+            "sentinel_stac_service": stac,
+            "inference": model,
+        }):
+            api._jobs["s1-parser-failure"] = {"status": "pending", "progress": "", "created_at": 0}
+            api._run_job("s1-parser-failure", {**self.payload, "bbox": self.bbox})
+        status = self.client.get("/api/detect/status/s1-parser-failure").json
+        self.assertEqual(status["error_code"], "gee_s1_orbit_metadata_invalid")
+        self.assertEqual(status["meta"]["diagnostic"]["stage"], "s1_t1_orbit_metadata_parse")
 
     def test_s1_orbit_query_diagnostics_survive_job_polling(self):
         error = gee_service.GEEAcquisitionError(

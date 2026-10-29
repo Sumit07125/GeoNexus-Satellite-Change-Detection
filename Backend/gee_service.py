@@ -175,6 +175,19 @@ def _safe_error_reason(error: Exception) -> str:
     return reason[:240]
 
 
+def _parse_integral_number(value, field_name: str) -> int:
+    """Parse EE numeric metadata without truncating fractional or non-finite values."""
+    if isinstance(value, (bool, np.bool_)):
+        raise ValueError(f"{field_name} must not be a boolean.")
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError, OverflowError) as error:
+        raise ValueError(f"{field_name} is not numeric: {value!r}") from error
+    if not math.isfinite(numeric) or not numeric.is_integer():
+        raise ValueError(f"{field_name} must be a finite whole number: {value!r}")
+    return int(numeric)
+
+
 def _diagnostic_base(date_t1: str, date_t2: str, window_days: int, max_cloud: int, bbox: tuple[float, ...]) -> dict:
     return {
         "provider": "Google Earth Engine",
@@ -376,13 +389,13 @@ def _get_s1_orbit_candidates(bbox: ee.Geometry, date_str: str, window_days: int,
             raise ValueError("Orbit histogram response was not a dictionary.")
         orbit_counts = {}
         for raw_orbit, raw_count in histogram.items():
-            orbit = int(raw_orbit)
-            count = int(raw_count)
-            if str(orbit) != str(raw_orbit) or not 1 <= orbit <= 175:
+            orbit = _parse_integral_number(raw_orbit, "relative orbit ID")
+            count = _parse_integral_number(raw_count, f"scene count for orbit {orbit}")
+            if not 1 <= orbit <= 175:
                 raise ValueError("Orbit histogram contained an invalid relative orbit ID.")
             if orbit in orbit_counts:
                 raise ValueError("Orbit histogram contained duplicate normalized relative orbit IDs.")
-            if isinstance(raw_count, bool) or count != raw_count or count <= 0:
+            if count <= 0:
                 raise ValueError("Orbit histogram contained a non-positive or non-integral scene count.")
             orbit_counts[orbit] = count
         if not orbit_counts:
