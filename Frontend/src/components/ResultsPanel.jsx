@@ -167,8 +167,8 @@ function DynamicsSection({ dynamics, activeFilters, onToggleFilter }) {
   return (
     <div className="dynamics-section fade-in-up">
       <div className="dynamics-header">
-        <div className="dynamics-title">
-          <span>🌐</span> Surface Dynamics Classification
+        <div className="dynamics-title" title="Deterministic spectral rule-based post-processing breakdown of predicted changed pixels. Not a learned multi-class segmentation head.">
+          <span>🌐</span> Surface Dynamics Interpretation (Rule-Based Decomposition)
         </div>
         <div className="dynamics-header-right">
           <span className="dynamics-hint">

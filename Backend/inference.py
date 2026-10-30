@@ -137,10 +137,10 @@ PATCH = 128
 STRIDE = 64
 
 
-def _infer_tiled(t1: torch.Tensor, t2: torch.Tensor) -> np.ndarray:
+def _infer_tiled(t1: torch.Tensor, t2: torch.Tensor) -> tuple[np.ndarray, dict]:
     """
     Run sliding-window inference. t1/t2: [1, 17, H, W] on _device.
-    Returns probability map [H, W] float32.
+    Returns (probability map [H, W] float32, gate_diagnostics dict).
     """
     _, _, H, W = t1.shape
     prob_sum = torch.zeros(H, W, device=_device)
@@ -155,6 +155,11 @@ def _infer_tiled(t1: torch.Tensor, t2: torch.Tensor) -> np.ndarray:
     if not xs or xs[-1] + PATCH < W:
         xs.append(max(0, W - PATCH))
 
+    gate_stats_raw = [
+        {"min": float("inf"), "max": float("-inf"), "sum": 0.0, "sum_sq": 0.0, "count": 0}
+        for _ in range(8)
+    ]
+
     with torch.no_grad():
         for y in ys:
             for x in xs:
@@ -165,8 +170,58 @@ def _infer_tiled(t1: torch.Tensor, t2: torch.Tensor) -> np.ndarray:
                 prob_sum[y:y+PATCH, x:x+PATCH] += prob
                 count[y:y+PATCH, x:x+PATCH] += 1.0
 
+                gates = out.get("gates", [])
+                for i, g in enumerate(gates):
+                    if i >= 8:
+                        break
+                    g_val = g.detach().cpu().float().numpy()
+                    gate_stats_raw[i]["min"] = min(gate_stats_raw[i]["min"], float(g_val.min()))
+                    gate_stats_raw[i]["max"] = max(gate_stats_raw[i]["max"], float(g_val.max()))
+                    gate_stats_raw[i]["sum"] += float(g_val.sum())
+                    gate_stats_raw[i]["sum_sq"] += float((g_val ** 2).sum())
+                    gate_stats_raw[i]["count"] += int(g_val.size)
+
     count = count.clamp(min=1.0)
-    return (prob_sum / count).cpu().numpy().astype(np.float32)
+    prob_map = (prob_sum / count).cpu().numpy().astype(np.float32)
+
+    stages_t1 = {}
+    stages_t2 = {}
+    all_sum = 0.0
+    all_count = 0
+
+    for i in range(8):
+        st = gate_stats_raw[i]
+        if st["count"] > 0:
+            mean = st["sum"] / st["count"]
+            var = max(0.0, (st["sum_sq"] / st["count"]) - (mean ** 2))
+            std = math.sqrt(var)
+            stage_dict = {
+                "mean": round(float(mean), 4),
+                "std": round(float(std), 4),
+                "min": round(float(st["min"]), 4),
+                "max": round(float(st["max"]), 4),
+            }
+            all_sum += st["sum"]
+            all_count += st["count"]
+        else:
+            stage_dict = {"mean": 0.0, "std": 0.0, "min": 0.0, "max": 0.0}
+
+        stage_idx = i % 4
+        if i < 4:
+            stages_t1[f"stage_{stage_idx}"] = stage_dict
+        else:
+            stages_t2[f"stage_{stage_idx}"] = stage_dict
+
+    overall_mean = round(all_sum / all_count, 4) if all_count > 0 else 0.0
+    gate_diagnostics = {
+        "overall_mean": overall_mean,
+        "stages_t1": stages_t1,
+        "stages_t2": stages_t2,
+        "optical_weight_pct": round(overall_mean * 100.0, 2),
+        "sar_weight_pct": round((1.0 - overall_mean) * 100.0, 2),
+    }
+
+    return prob_map, gate_diagnostics
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -305,6 +360,8 @@ def _classify_surface_dynamics(
 
     pixel_area_ha = 0.01  # 10m x 10m = 0.01 ha
     dynamics_stats = {
+        "provenance": "Rule-based spectral decomposition of binary changed pixels",
+        "method": "rule_based_spectral_decomposition",
         "water": {
             "pct": round(w_cnt / changed_count * 100, 1),
             "ha": round(w_cnt * pixel_area_ha, 1),
@@ -425,7 +482,25 @@ def run_inference(
     t2_t = torch.from_numpy(t2_norm).unsqueeze(0).to(_device)
 
     # Tiled inference
-    prob = _infer_tiled(t1_t, t2_t)   # [H, W] float32
+    prob, gate_diagnostics = _infer_tiled(t1_t, t2_t)   # [H, W] float32
+
+    # Q-channel input summary
+    q1 = t1_tensor[16]
+    q2 = t2_tensor[16]
+    gate_diagnostics["q_input_stats"] = {
+        "t1": {
+            "min": round(float(q1.min()), 4),
+            "max": round(float(q1.max()), 4),
+            "mean": round(float(q1.mean()), 4),
+            "std": round(float(q1.std()), 4),
+        },
+        "t2": {
+            "min": round(float(q2.min()), 4),
+            "max": round(float(q2.max()), 4),
+            "mean": round(float(q2.mean()), 4),
+            "std": round(float(q2.std()), 4),
+        },
+    }
 
     # Threshold (strictly excluding nodata / swath border pixels)
     valid_mask = (t1_tensor[:3].sum(0) > 30) & (t2_tensor[:3].sum(0) > 30)
@@ -468,6 +543,7 @@ def run_inference(
         "max_prob": round(float(prob.max()), 4),
         "threshold": threshold,
         "output_size": list(prob.shape),
+        "gate_diagnostics": gate_diagnostics,
     }
 
     return {
@@ -480,5 +556,6 @@ def run_inference(
         "overlay_b64": overlay_b64,
         "dynamics": dynamics_stats,
         "stats": stats,
+        "gate_diagnostics": gate_diagnostics,
     }
 

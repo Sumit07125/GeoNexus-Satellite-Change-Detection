@@ -17,7 +17,9 @@ Physical reference:
   - Urban dihedral / trihedral corner reflectors (buildings, bridges, industrial
     steel structures) legitimately produce intense co-polarization double-bounce
     backscatter reaching +10 dB to +25 dB (1000 to 2500 in dB×100).
-  - Physical instrument / sensor bounds:
+  - Project validation guardrail bounds (operational limits for rejecting corrupted or
+    uncalibrated values; these represent pipeline software guardrails rather than
+    official ESA instrument specifications):
       VV:    [-6000, 3000] (-60 dB to +30 dB)
       VH:    [-6000, 2000] (-60 dB to +20 dB)
       VH_VV: [-6000, 1500] (-60 dB to +15 dB)
@@ -32,7 +34,9 @@ import numpy as np
 SAR_CHANNELS = ["VV", "VH", "VH_VV"]
 SAR_CHANNEL_INDICES = {"VV": 13, "VH": 14, "VH_VV": 15}
 
-# Physical bounds: hard errors if violated (indicates corruption, unphysical values, or sensor saturation)
+# Project validation guardrail bounds: hard errors if violated (indicates corruption, unphysical values, or sensor saturation)
+# Note: These are Geo-Nexus project operational guardrails calibrated for the Sentinel-1 GRD ingestion pipeline,
+# not official ESA sensor specifications.
 # Stored units: dB × 100
 SAR_PHYSICAL_LIMITS = {
     "VV": {"lower": -6000.0, "upper": 3000.0, "unit": "dB_x100"},

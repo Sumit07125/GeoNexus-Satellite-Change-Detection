@@ -1325,36 +1325,115 @@ export default function App() {
                 </div>
               ) : activeDisplayedResult ? (
                 <>
-                  {/* ── Non-blocking quality-distribution notice ── */}
-                  {activeDisplayedResult?.meta?.input_quality?.warnings?.length > 0 && (
-                    <div style={{
-                      margin: '0 0 0.75rem 0',
-                      padding: '0.65rem 0.85rem',
-                      background: 'rgba(251,191,36,0.07)',
-                      border: '1px solid rgba(251,191,36,0.22)',
-                      borderRadius: 'var(--radius)',
-                      fontSize: '0.76rem',
-                      lineHeight: 1.6,
-                      color: 'var(--c-text2)',
-                    }}>
-                      <div style={{ fontWeight: 600, color: 'var(--c-amber)', marginBottom: '0.3rem' }}>
-                        ⚠ Quality Distribution Notice — Inference Proceeded
+                  {/* ── Separate, Deduplicated Warnings Display ── */}
+                  {(() => {
+                    const inputQ = activeDisplayedResult?.meta?.input_quality || {};
+                    const allWarnings = inputQ.warnings || [];
+                    const seen = new Set();
+                    const deduped = allWarnings.filter((w) => {
+                      if (!w) return false;
+                      const k = `${w.code || ''}_${w.label || ''}_${w.date || ''}_${w.channel || ''}`;
+                      if (seen.has(k)) return false;
+                      seen.add(k);
+                      return true;
+                    });
+
+                    const qWarnings = deduped.filter(
+                      (w) => w.code === 'quality_signal_low_spatial_variance' || (typeof w.code === 'string' && w.code.includes('quality'))
+                    );
+                    const sarWarnings = deduped.filter(
+                      (w) => typeof w.code === 'string' && w.code.startsWith('sar_')
+                    );
+                    const otherWarnings = deduped.filter(
+                      (w) => !qWarnings.includes(w) && !sarWarnings.includes(w)
+                    );
+
+                    if (deduped.length === 0) return null;
+
+                    return (
+                      <div className="warnings-container" style={{ marginBottom: '0.85rem', display: 'flex', flexDirection: 'column', gap: '0.6rem' }}>
+                        {/* Quality Distribution Notice */}
+                        {qWarnings.length > 0 && (
+                          <div style={{
+                            padding: '0.65rem 0.85rem',
+                            background: 'rgba(251,191,36,0.07)',
+                            border: '1px solid rgba(251,191,36,0.22)',
+                            borderRadius: 'var(--radius)',
+                            fontSize: '0.76rem',
+                            lineHeight: 1.6,
+                            color: 'var(--c-text2)',
+                          }}>
+                            <div style={{ fontWeight: 600, color: 'var(--c-amber)', marginBottom: '0.3rem' }}>
+                              ⚠ Quality Distribution Notice — Inference Proceeded
+                            </div>
+                            {qWarnings.map((w, i) => (
+                              <div key={`q_${w.label}_${w.date}_${i}`} style={{ marginBottom: '0.25rem' }}>
+                                <strong>{w.label} ({w.date}):</strong> Q channel saturated/uniform —
+                                raw n_clear std={w.raw_n_clear_std !== undefined ? Number(w.raw_n_clear_std).toFixed(4) : '—'},
+                                encoded Q∈[{w.encoded_min ?? '—'}, {w.encoded_max ?? '—'}].{' '}
+                                {w.value_counts && (
+                                  <span>n_clear histogram: {Object.entries(w.value_counts).map(([k, v]) => `${k}×${v}px`).join(', ')}. </span>
+                                )}
+                              </div>
+                            ))}
+                            <div style={{ marginTop: '0.25rem', color: 'var(--c-text3)' }}>
+                              Q is saturated or has low spatial variance across this scene. The input passed numerical validation [0, 1] and inference proceeded with a quality-distribution notice. Spatially uniform Q does not guarantee prediction accuracy.
+                            </div>
+                          </div>
+                        )}
+
+                        {/* SAR Backscatter Notice */}
+                        {sarWarnings.length > 0 && (
+                          <div style={{
+                            padding: '0.65rem 0.85rem',
+                            background: 'rgba(59,130,246,0.07)',
+                            border: '1px solid rgba(59,130,246,0.25)',
+                            borderRadius: 'var(--radius)',
+                            fontSize: '0.76rem',
+                            lineHeight: 1.6,
+                            color: 'var(--c-text2)',
+                          }}>
+                            <div style={{ fontWeight: 600, color: '#60a5fa', marginBottom: '0.3rem' }}>
+                              📡 Radar Backscatter Distribution Notice — Inference Proceeded
+                            </div>
+                            {sarWarnings.map((w, i) => (
+                              <div key={`sar_${w.label}_${w.date}_${w.channel}_${i}`} style={{ marginBottom: '0.35rem' }}>
+                                <strong>{w.label} ({w.date}) {w.channel} (ch {w.channel_index}):</strong>{' '}
+                                Observed range [{w.observed_min !== undefined ? (Number(w.observed_min) / 100).toFixed(2) : '—'} to {w.observed_max !== undefined ? (Number(w.observed_max) / 100).toFixed(2) : '—'} dB]
+                                {w.outside_count !== undefined && ` (${w.outside_count} px outside typical training quantiles)`}.{' '}
+                                <span style={{ color: 'var(--c-text3)' }}>{w.interpretation}</span>
+                              </div>
+                            ))}
+                            <div style={{ marginTop: '0.25rem', color: 'var(--c-text3)' }}>
+                              Sentinel-1 C-band backscatter values passed Geo-Nexus project physical guardrails. Distribution notices highlight localized urban reflections or cross-polarization contrasts relative to the training distribution.
+                            </div>
+                          </div>
+                        )}
+
+                        {/* General / Other Notices */}
+                        {otherWarnings.length > 0 && (
+                          <div style={{
+                            padding: '0.65rem 0.85rem',
+                            background: 'rgba(148,163,184,0.08)',
+                            border: '1px solid rgba(148,163,184,0.22)',
+                            borderRadius: 'var(--radius)',
+                            fontSize: '0.76rem',
+                            lineHeight: 1.6,
+                            color: 'var(--c-text2)',
+                          }}>
+                            <div style={{ fontWeight: 600, color: 'var(--c-text1)', marginBottom: '0.3rem' }}>
+                              ℹ Additional Processing Notice
+                            </div>
+                            {otherWarnings.map((w, i) => (
+                              <div key={`other_${i}`} style={{ marginBottom: '0.25rem' }}>
+                                <strong>{w.label ? `${w.label}: ` : ''}</strong>{w.interpretation || w.message || JSON.stringify(w)}
+                              </div>
+                            ))}
+                          </div>
+                        )}
                       </div>
-                      {activeDisplayedResult.meta.input_quality.warnings.map((w, i) => (
-                        <div key={i} style={{ marginBottom: '0.25rem' }}>
-                          <strong>{w.label} ({w.date}):</strong> Q channel saturated/uniform —
-                          raw n_clear std={w.raw_n_clear_std !== undefined ? Number(w.raw_n_clear_std).toFixed(4) : '—'},
-                          encoded Q∈[{w.encoded_min ?? '—'}, {w.encoded_max ?? '—'}].{' '}
-                          {w.value_counts && (
-                            <span>n_clear histogram: {Object.entries(w.value_counts).map(([k, v]) => `${k}×${v}px`).join(', ')}. </span>
-                          )}
-                        </div>
-                      ))}
-                      <div style={{ marginTop: '0.25rem', color: 'var(--c-text3)' }}>
-                        Every pixel had a similar number of clear observations — this is expected for cloud-free urban scenes and does not indicate a data problem. The AI model's QualityGate processed this as valid high-quality input. Verify with Spectral Analysis if uncertain.
-                      </div>
-                    </div>
-                  )}
+                    );
+                  })()}
                   <ResultsPanel
                     data={activeDisplayedResult}
                     activeFilters={overlayFilters}
