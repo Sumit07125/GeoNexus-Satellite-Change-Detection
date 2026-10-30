@@ -260,19 +260,6 @@ def _safe_provider_detail(error):
     return detail[:240]
 
 
-def _dedupe_warnings(warn_list: list[dict]) -> list[dict]:
-    seen = set()
-    deduped = []
-    for w in warn_list:
-        if not isinstance(w, dict):
-            continue
-        k = f"{w.get('code')}_{w.get('label')}_{w.get('date')}_{w.get('channel')}"
-        if k not in seen:
-            seen.add(k)
-            deduped.append(w)
-    return deduped
-
-
 def _validate_imagery(imagery, require_sar=False):
     import numpy as np
     t1, t2 = imagery.get("t1_tensor"), imagery.get("t2_tensor")
@@ -359,7 +346,6 @@ def _validate_imagery(imagery, require_sar=False):
                 warn_entry = {
                     "code": "quality_signal_low_spatial_variance",
                     "date": date, "label": label,
-                    "channel": "Q", "channel_index": 16,
                     "raw_n_clear_std": round(raw_n_clear_std, 6),
                     "encoded_q_std": round(quality_std, 6) if quality_std is not None else None,
                     "raw_min": raw_min, "raw_max": raw_max,
@@ -367,18 +353,14 @@ def _validate_imagery(imagery, require_sar=False):
                     "percentiles": raw_quality_stats.get("percentiles_p5_p25_p50_p75_p95"),
                     "value_counts": raw_quality_stats.get("value_counts"),
                     "interpretation": (
-                        "Q is real and numerically valid within [0, 1] but has low spatial variance or is uniform across this scene. "
-                        "The QualityGate module received this input and inference proceeded with a quality-distribution notice. "
-                        "Spatially uniform Q does not guarantee prediction accuracy."
+                        "Q is real and valid but spatially uniform/saturated: every pixel had a "
+                        "similar number of clear observations. This is expected for cloud-free urban "
+                        "scenes. The QualityGate receives a valid high-quality signal; inference "
+                        "proceeds. The resulting prediction carries this warning in its metadata."
                     ),
                 }
                 existing_warns = meta.setdefault("input_quality", {}).setdefault("warnings", [])
                 existing_warns.append(warn_entry)
-                input_q = meta.setdefault("input_quality", {})
-                q_warns = input_q.setdefault("quality_warnings", [])
-                q_warns.append(warn_entry)
-                input_q["quality_warnings"] = _dedupe_warnings(q_warns)
-                input_q["warnings"] = _dedupe_warnings(existing_warns)
                 meta["input_quality"]["status"] = "valid_uniform_or_saturated"
                 imagery["meta"] = meta
                 app.logger.info(
@@ -419,15 +401,7 @@ def _validate_imagery(imagery, require_sar=False):
                 raise
             meta.setdefault("sar_diagnostics", {})[label.lower()] = sar_diag
             if sar_warns:
-                input_q = meta.setdefault("input_quality", {})
-                sar_list = input_q.setdefault("sar_warnings", [])
-                sar_list.extend(sar_warns)
-                input_q["sar_warnings"] = _dedupe_warnings(sar_list)
-
-                all_warns = input_q.setdefault("warnings", [])
-                all_warns.extend(sar_warns)
-                input_q["warnings"] = _dedupe_warnings(all_warns)
-
+                meta.setdefault("input_quality", {}).setdefault("warnings", []).extend(sar_warns)
                 meta["sar_status"] = "valid_with_distribution_notices"
     valid = (t1[2] > 100) & (t1[6] > 100) & (t2[2] > 100) & (t2[6] > 100)
     if float(valid.mean()) < 0.05:
@@ -587,8 +561,7 @@ def _run_job(job_id: str, payload: dict):
             "overlay":     f"data:image/png;base64,{result['overlay_b64']}",
             "dynamics":    result.get("dynamics", {}),
             "stats":       result["stats"],
-            "gate_diagnostics": result.get("gate_diagnostics", {}),
-            "meta":        {**imagery["meta"], "gate_diagnostics": result.get("gate_diagnostics", {})},
+            "meta":        imagery["meta"],
         }
 
         # ── Permanent SQLite storage persistence ──────────────────────
