@@ -181,6 +181,9 @@ function MapControls({ setBbox, drawing, setDrawing, bbox, hoverDims }) {
           <button className="map-preset-btn" onClick={() => setPresetCenterBox(1.0)} title="Compact 1 km × 1 km local site">
             1 km
           </button>
+          <button className="map-preset-btn" onClick={() => setPresetCenterBox(1.4)} title="AI-ready 1.4 km × 1.4 km minimum area">
+            1.4 km · AI Ready
+          </button>
           <button className="map-preset-btn" onClick={() => setPresetCenterBox(2.0)} title="High-clarity 2 km × 2 km area">
             2 km
           </button>
@@ -253,7 +256,10 @@ function MapFlyTo({ bbox }) {
         [bbox.lat_max, bbox.lon_max],
       ];
       try {
-        map.fitBounds(bounds, { padding: [50, 50], maxZoom: 15, duration: 0.8 });
+        const currentBounds = map.getBounds();
+        if (!currentBounds.contains(bounds)) {
+          map.fitBounds(bounds, { padding: [40, 40], maxZoom: 13, duration: 0.6 });
+        }
       } catch {
         // silent catch if unmounted
       }

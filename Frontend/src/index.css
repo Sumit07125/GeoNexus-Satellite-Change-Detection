@@ -718,6 +718,7 @@ code, pre { font-family: var(--font-mono); }
   border-radius: 8px;
   padding: 3px 6px;
   backdrop-filter: blur(10px);
+  flex-wrap: nowrap;
 }
 
 .map-preset-label {
@@ -1129,13 +1130,14 @@ code, pre { font-family: var(--font-mono); }
 
 /* Leaflet zoom controls offset so they never collide with the sidebar */
 .leaflet-top.leaflet-left {
-  margin-top: 18px !important;
-  margin-left: 24px !important;
-  transition: margin-left 0.25s ease;
+  margin-top: 56px !important;
+  margin-left: 14px !important;
+  transition: margin-left 0.25s ease, margin-top 0.25s ease;
 }
 
 .main-content.sidebar-collapsed .leaflet-top.leaflet-left {
-  margin-left: 56px !important;
+  margin-top: 56px !important;
+  margin-left: 14px !important;
 }
 
 .leaflet-draw-toolbar a {
