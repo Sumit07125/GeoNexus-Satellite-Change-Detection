@@ -1,5 +1,4 @@
-import React, { useState, useEffect } from 'react';
-import { createFilteredOverlay } from '../utils/overlayFilter';
+import React, { useState } from 'react';
 import { getEngineLabel } from '../utils/analysisMethods';
 
 /* ─────────────────────────────────────────────────────────────
@@ -85,33 +84,18 @@ function PanelCard({ title, subtitle, icon, accent, src, date, badge, onClick, e
 }
 
 /* ── Interactive Before / After Split Slider ───────────────── */
-function ComparisonSlider({ t1Src, t2Src, overlaySrc, t1Date, t2Date }) {
+function ComparisonSlider({ t1Src, t2Src, t1Date, t2Date }) {
   const [sliderPos, setSliderPos] = useState(50);
-  const [compareMode, setCompareMode] = useState('t1_t2'); // 't1_t2' | 't2_overlay'
 
-  const leftSrc = compareMode === 't1_t2' ? t1Src : t2Src;
-  const rightSrc = compareMode === 't1_t2' ? t2Src : overlaySrc;
-  const leftLabel = compareMode === 't1_t2' ? `Before T1 (${t1Date || 'Pre'})` : `Optical T2 (${t2Date || 'Post'})`;
-  const rightLabel = compareMode === 't1_t2' ? `Current T2 (${t2Date || 'Post'})` : 'T2 + Filtered Overlay';
+  const leftSrc = t1Src;
+  const rightSrc = t2Src;
+  const leftLabel = `Before T1 (${t1Date || 'Pre'})`;
+  const rightLabel = `Current T2 (${t2Date || 'Post'})`;
 
   return (
     <div className="comparison-container">
       <div className="comparison-toolbar">
-        <div className="comparison-mode-btns">
-          <button
-            className={`btn-toggle ${compareMode === 't1_t2' ? 'active' : ''}`}
-            onClick={() => setCompareMode('t1_t2')}
-          >
-            T1 (Before) ↔ T2 (Current)
-          </button>
-          <button
-            className={`btn-toggle ${compareMode === 't2_overlay' ? 'active' : ''}`}
-            onClick={() => setCompareMode('t2_overlay')}
-          >
-            T2 (Current) ↔ Overlay Fusion
-          </button>
-        </div>
-        <div className="comparison-hint">
+      <div className="comparison-hint">
           ↔ Drag slider to wipe & inspect changes
         </div>
       </div>
@@ -158,7 +142,7 @@ function ComparisonSlider({ t1Src, t2Src, overlaySrc, t1Date, t2Date }) {
 }
 
 /* ── Surface Dynamics Classification Section with interactive toggles ── */
-function DynamicsSection({ dynamics, activeFilters, onToggleFilter }) {
+function DynamicsSection({ dynamics }) {
   if (!dynamics || Object.keys(dynamics).length === 0) return null;
 
   // Render order: Urban & Structural first, then Vegetation, Soil, Water
@@ -169,11 +153,6 @@ function DynamicsSection({ dynamics, activeFilters, onToggleFilter }) {
       <div className="dynamics-header">
         <div className="dynamics-title" title="Deterministic spectral rule-based post-processing breakdown of predicted changed pixels. Not a learned multi-class segmentation head.">
           <span>🌐</span> Surface Dynamics Interpretation (Rule-Based Decomposition)
-        </div>
-        <div className="dynamics-header-right">
-          <span className="dynamics-hint">
-            💡 Click cards or check/uncheck to filter colors on satellite overlay
-          </span>
         </div>
       </div>
 
@@ -189,7 +168,7 @@ function DynamicsSection({ dynamics, activeFilters, onToggleFilter }) {
             icon: '📌',
           };
 
-          const isChecked = activeFilters ? (activeFilters[key] ?? true) : true;
+          const isChecked = true;
 
           return (
             <div
@@ -197,10 +176,10 @@ function DynamicsSection({ dynamics, activeFilters, onToggleFilter }) {
               className={`dynamics-card ${isChecked ? 'is-active' : 'is-muted'}`}
               style={{
                 '--cat-color': meta.color,
-                cursor: onToggleFilter ? 'pointer' : 'default',
+                cursor: 'default',
               }}
-              onClick={() => onToggleFilter && onToggleFilter(key)}
-              title={isChecked ? `Click to hide ${meta.label} from overlay` : `Click to show ${meta.label} on overlay`}
+              
+              title={meta.label}
             >
               <div className="dynamics-card-top">
                 <div
@@ -225,11 +204,7 @@ function DynamicsSection({ dynamics, activeFilters, onToggleFilter }) {
                         background: isChecked ? meta.color : 'transparent',
                         borderColor: isChecked ? meta.color : 'var(--c-border)',
                       }}
-                      onClick={(e) => {
-                        e.stopPropagation();
-                        onToggleFilter?.(key);
-                      }}
-                      title={isChecked ? "Layer visible (click to hide)" : "Layer hidden (click to show)"}
+                      
                     >
                       {isChecked ? '✓' : ''}
                     </div>
@@ -247,9 +222,7 @@ function DynamicsSection({ dynamics, activeFilters, onToggleFilter }) {
                 </div>
                 <div className="dynamics-stat-ha">
                   {item.ha?.toLocaleString() ?? 0} ha
-                  <span className={`dynamics-visibility-tag ${isChecked ? 'visible' : 'hidden'}`}>
-                    {isChecked ? '● Visible' : '○ Hidden'}
-                  </span>
+                  
                 </div>
               </div>
 
@@ -302,63 +275,9 @@ function Modal({ src, title, date, onClose }) {
 }
 
 /* ── Main ResultsPanel Component ───────────────────────────── */
-export default function ResultsPanel({
-  data,
-  activeFilters: parentFilters,
-  onToggleFilter: parentToggleFilter,
-  onSetAllFilters: parentSetAllFilters,
-}) {
+export default function ResultsPanel({ data }) {
   const [activeTab, setActiveTab] = useState('grid'); // 'grid' | 'comparison'
   const [modal, setModal] = useState(null);
-
-  // Dynamic layer visibility filters (fallback if not controlled by parent)
-  const [localFilters, setLocalFilters] = useState({
-    urban: true,
-    vegetation: true,
-    bare_soil: true,
-    water: true,
-  });
-
-  const activeFilters = parentFilters || localFilters;
-
-  const toggleFilter = (key) => {
-    if (parentToggleFilter) {
-      parentToggleFilter(key);
-    } else {
-      setLocalFilters((prev) => ({ ...prev, [key]: !prev[key] }));
-    }
-  };
-
-  const setAllFilters = (enable) => {
-    if (parentSetAllFilters) {
-      parentSetAllFilters(enable);
-    } else {
-      setLocalFilters({
-        urban: enable,
-        vegetation: enable,
-        bare_soil: enable,
-        water: enable,
-      });
-    }
-  };
-
-  // Filtered overlay state generated in client-side canvas
-  const [filteredOverlay, setFilteredOverlay] = useState(data?.overlay || null);
-
-  // Re-generate client-side blended overlay when active filters or imagery changes
-  useEffect(() => {
-    if (!data) return;
-
-    createFilteredOverlay(
-      data.t2_rgb,
-      data.change_mask,
-      data.overlay,
-      activeFilters
-    ).then((resUrl) => {
-      setFilteredOverlay(resUrl);
-    });
-  }, [data, activeFilters]);
-
   if (!data) {
     return (
       <div className="empty-state">
@@ -377,7 +296,6 @@ export default function ResultsPanel({
     t2_rgb,
     binary_mask,
     change_prob,
-    overlay,
     dynamics,
     stats,
     meta,
@@ -419,23 +337,7 @@ export default function ResultsPanel({
   const changePct = stats?.change_pct ?? 0;
   const badgeClass = changePct > 20 ? 'change-high' : changePct > 8 ? 'change-med' : 'change-low';
   const changeLabel = changePct > 20 ? '⚠ High Change' : changePct > 8 ? '⚡ Moderate Change' : '✅ Low Change';
-
-  // Compute active filters count and label
-  const activeKeys = Object.keys(activeFilters).filter((k) => activeFilters[k]);
-  const activeCount = activeKeys.length;
-  let layerBadgeText = `${activeCount}/4 Layers`;
-  if (activeCount === 4) layerBadgeText = '🔥 All Layers (4/4)';
-  else if (activeCount === 0) layerBadgeText = '⚪ Satellite Only';
-  else if (activeCount === 1) {
-    const single = DYNAMICS_META[activeKeys[0]]?.short || activeKeys[0];
-    layerBadgeText = `🎯 ${single} Only`;
-  }
-
   const openModal = (src, title, date) => setModal({ src, title, date });
-
-  // Currently displayed overlay source for Panel 3 & Comparison
-  const currentOverlaySrc = filteredOverlay || overlay;
-
   return (
     <div className="results-section fade-in-up">
 
@@ -507,101 +409,6 @@ export default function ResultsPanel({
             }
           />
 
-          {/* Panel 3: T2 Overlap Mask (Satellite Fusion) with Dynamic Layer Filter */}
-          <PanelCard
-            title="T2 Change Overlay"
-            subtitle={sourceLabel}
-            icon="🔥"
-            accent="#ef4444"
-            badge={layerBadgeText}
-            src={currentOverlaySrc}
-            onClick={openModal}
-            extraControl={
-              <div className="panel-layer-filter-bar">
-                <span className="filter-bar-lead">Show Colors:</span>
-                <div className="filter-chips-list">
-                  {/* 🏗️ Urban & Structural */}
-                  <label
-                    className={`filter-tick-chip ${activeFilters.urban ? 'active' : ''}`}
-                    style={{ '--cat-accent': '#eab308' }}
-                    title="Toggle Urban & Structural (Yellow)"
-                  >
-                    <input
-                      type="checkbox"
-                      checked={activeFilters.urban}
-                      onChange={() => toggleFilter('urban')}
-                    />
-                    <span className="chip-tick-mark">✓</span>
-                    <span className="chip-label">🏗️ Urban</span>
-                  </label>
-
-                  {/* 🌿 Vegetation Dynamics */}
-                  <label
-                    className={`filter-tick-chip ${activeFilters.vegetation ? 'active' : ''}`}
-                    style={{ '--cat-accent': '#22c55e' }}
-                    title="Toggle Vegetation Dynamics (Green)"
-                  >
-                    <input
-                      type="checkbox"
-                      checked={activeFilters.vegetation}
-                      onChange={() => toggleFilter('vegetation')}
-                    />
-                    <span className="chip-tick-mark">✓</span>
-                    <span className="chip-label">🌿 Veg</span>
-                  </label>
-
-                  {/* 🌾 Soil & Agriculture */}
-                  <label
-                    className={`filter-tick-chip ${activeFilters.bare_soil ? 'active' : ''}`}
-                    style={{ '--cat-accent': '#f97316' }}
-                    title="Toggle Soil & Agriculture (Orange)"
-                  >
-                    <input
-                      type="checkbox"
-                      checked={activeFilters.bare_soil}
-                      onChange={() => toggleFilter('bare_soil')}
-                    />
-                    <span className="chip-tick-mark">✓</span>
-                    <span className="chip-label">🌾 Soil</span>
-                  </label>
-
-                  {/* 💧 Water Dynamics */}
-                  <label
-                    className={`filter-tick-chip ${activeFilters.water ? 'active' : ''}`}
-                    style={{ '--cat-accent': '#2563eb' }}
-                    title="Toggle Water Dynamics (Blue)"
-                  >
-                    <input
-                      type="checkbox"
-                      checked={activeFilters.water}
-                      onChange={() => toggleFilter('water')}
-                    />
-                    <span className="chip-tick-mark">✓</span>
-                    <span className="chip-label">💧 Water</span>
-                  </label>
-
-                  <div className="filter-quick-actions">
-                    <button
-                      type="button"
-                      className="btn-filter-quick"
-                      onClick={() => setAllFilters(true)}
-                      title="Show all dynamic layers"
-                    >
-                      All
-                    </button>
-                    <button
-                      type="button"
-                      className="btn-filter-quick"
-                      onClick={() => setAllFilters(false)}
-                      title="Hide all colors (show natural satellite)"
-                    >
-                      Clear
-                    </button>
-                  </div>
-                </div>
-              </div>
-            }
-          />
           <PanelCard
             title="Binary Change Mask"
             subtitle="White = flagged change · Black = unchanged"
@@ -630,7 +437,6 @@ export default function ResultsPanel({
         <ComparisonSlider
           t1Src={t1_rgb}
           t2Src={t2_rgb}
-          overlaySrc={currentOverlaySrc}
           t1Date={meta?.t1_date}
           t2Date={meta?.t2_date}
         />
@@ -639,66 +445,18 @@ export default function ResultsPanel({
       {/* ── Surface Dynamics Classification with interactive card toggles ── */}
       <DynamicsSection
         dynamics={dynamics}
-        activeFilters={activeFilters}
-        onToggleFilter={toggleFilter}
       />
 
-      {/* ── Dynamics Color Legend (Interactive: click to toggle) ── */}
+
+      {/* static Dynamics Color Legend */}
       <div className="cd-legend">
-        <span className="cd-legend-label">Dynamics Legend (Click to filter) →</span>
+        <span className="cd-legend-label">Surface Dynamics Legend</span>
         <div className="cd-legend-bar">
-          <div
-            className={`cd-legend-stop ${activeFilters.water ? 'active' : 'inactive'}`}
-            title="Click to toggle Water Dynamics"
-            onClick={() => toggleFilter('water')}
-            style={{ cursor: 'pointer' }}
-          >
-            <div className="cd-legend-swatch" style={{ background: '#2563eb', opacity: activeFilters.water ? 1 : 0.3 }} />
-            <span className="cd-legend-text" style={{ opacity: activeFilters.water ? 1 : 0.5 }}>
-              💧 Water {activeFilters.water ? '✓' : ''}
-            </span>
-          </div>
-
-          <div
-            className={`cd-legend-stop ${activeFilters.vegetation ? 'active' : 'inactive'}`}
-            title="Click to toggle Vegetation Dynamics"
-            onClick={() => toggleFilter('vegetation')}
-            style={{ cursor: 'pointer' }}
-          >
-            <div className="cd-legend-swatch" style={{ background: '#22c55e', opacity: activeFilters.vegetation ? 1 : 0.3 }} />
-            <span className="cd-legend-text" style={{ opacity: activeFilters.vegetation ? 1 : 0.5 }}>
-              🌿 Vegetation {activeFilters.vegetation ? '✓' : ''}
-            </span>
-          </div>
-
-          <div
-            className={`cd-legend-stop ${activeFilters.urban ? 'active' : 'inactive'}`}
-            title="Click to toggle Urban & Structural"
-            onClick={() => toggleFilter('urban')}
-            style={{ cursor: 'pointer' }}
-          >
-            <div className="cd-legend-swatch" style={{ background: '#eab308', opacity: activeFilters.urban ? 1 : 0.3 }} />
-            <span className="cd-legend-text" style={{ opacity: activeFilters.urban ? 1 : 0.5 }}>
-              🏗️ Urban/Struct {activeFilters.urban ? '✓' : ''}
-            </span>
-          </div>
-
-          <div
-            className={`cd-legend-stop ${activeFilters.bare_soil ? 'active' : 'inactive'}`}
-            title="Click to toggle Soil & Agriculture"
-            onClick={() => toggleFilter('bare_soil')}
-            style={{ cursor: 'pointer' }}
-          >
-            <div className="cd-legend-swatch" style={{ background: '#f97316', opacity: activeFilters.bare_soil ? 1 : 0.3 }} />
-            <span className="cd-legend-text" style={{ opacity: activeFilters.bare_soil ? 1 : 0.5 }}>
-              🌾 Soil/Agri {activeFilters.bare_soil ? '✓' : ''}
-            </span>
-          </div>
-
-          <div className="cd-legend-stop" title="No detected surface change">
-            <div className="cd-legend-swatch" style={{ background: '#0a0f1d', border: '1px solid rgba(255,255,255,0.1)' }} />
-            <span className="cd-legend-text">⬛ Stable Ground</span>
-          </div>
+          <div className="cd-legend-stop"><div className="cd-legend-swatch" style={{ background: "#2563eb" }} /><span className="cd-legend-text">Water</span></div>
+          <div className="cd-legend-stop"><div className="cd-legend-swatch" style={{ background: "#22c55e" }} /><span className="cd-legend-text">Vegetation</span></div>
+          <div className="cd-legend-stop"><div className="cd-legend-swatch" style={{ background: "#eab308" }} /><span className="cd-legend-text">Urban</span></div>
+          <div className="cd-legend-stop"><div className="cd-legend-swatch" style={{ background: "#f97316" }} /><span className="cd-legend-text">Soil/Agri</span></div>
+          <div className="cd-legend-stop"><div className="cd-legend-swatch" style={{ background: "#0a0f1d", border: "1px solid rgba(255,255,255,0.1)" }} /><span className="cd-legend-text">Stable</span></div>
         </div>
       </div>
 

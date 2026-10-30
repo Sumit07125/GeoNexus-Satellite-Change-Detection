@@ -1,4 +1,4 @@
-import React, { useState, useCallback, useEffect } from 'react';
+﻿import React, { useState, useCallback, useEffect } from 'react';
 import axios from 'axios';
 import './index.css';
 import LocationMap from './components/LocationMap';
@@ -557,28 +557,6 @@ export default function App() {
     }
     return result || (savedPredictions[0]?.result ?? null);
   })();
-
-  // ── Dynamic category color filters (Urban, Vegetation, Soil, Water) ──
-  const [overlayFilters, setOverlayFilters] = useState({
-    urban: true,
-    vegetation: true,
-    bare_soil: true,
-    water: true,
-  });
-
-  const handleToggleOverlayFilter = useCallback((key) => {
-    setOverlayFilters((prev) => ({ ...prev, [key]: !prev[key] }));
-  }, []);
-
-  const handleSetAllOverlayFilters = useCallback((enable) => {
-    setOverlayFilters({
-      urban: enable,
-      vegetation: enable,
-      bare_soil: enable,
-      water: enable,
-    });
-  }, []);
-
   const canAnalyze = bbox && dateT1 && dateT2 && !loading;
   const bboxDimensions = bboxDimensionsKm(bbox);
   const acquisitionDiagnostics = errorMeta?.diagnostic || {};
@@ -1436,9 +1414,6 @@ export default function App() {
                   })()}
                   <ResultsPanel
                     data={activeDisplayedResult}
-                    activeFilters={overlayFilters}
-                    onToggleFilter={handleToggleOverlayFilter}
-                    onSetAllFilters={handleSetAllOverlayFilters}
                   />
                 </>
               ) : (
